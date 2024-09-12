@@ -16,7 +16,8 @@ find_package(Python3 COMPONENTS Development Interpreter)
 find_package(pybind11 REQUIRED)
 
 pybind11_add_module(opm_CoSTA opm_CoSTA.cpp)
-target_sources(opm_CoSTA PRIVATE flow_onephase_CoSTA.cpp
+target_sources(opm_CoSTA PRIVATE flow_blackoil_CoSTA.cpp
+                                 flow_onephase_CoSTA.cpp
                                  moduleVersion.cpp 
                                  CoSTAModule.hpp)
 

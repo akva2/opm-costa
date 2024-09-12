@@ -1,10 +1,13 @@
 #ifndef COSTA_MODULE_HPP
 #define COSTA_MODULE_HPP
 
+#include <opm/models/parallel/threadmanager.hpp>
 #include <opm/simulators/flow/Main.hpp>
+#include <opm/simulators/flow/SimulatorFullyImplicitBlackoil.hpp>
 
 #include <map>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -16,7 +19,7 @@ public:
     using Opm::Main::Main;
 
     template<class TypeTag>
-    int initialize()
+    bool initialize()
     {
         int exitCode = EXIT_SUCCESS;
         if (initialize_<TypeTag>(exitCode)) {
@@ -26,8 +29,20 @@ public:
         } else {
             throw std::runtime_error("Error initializing simulator");
         }
+
+        return exitCode == EXIT_SUCCESS;
     }
 };
+
+// template<class TypeTag>
+// class CoSTASimulator : public Opm::SimulatorFullyImplicitBlackoil<TypeTag>
+// {
+//     using Simulator = Opm::GetPropType<TypeTag, Opm::Properties::Simulator>;
+// public:
+//     explicit CoSTASimulator(Simulator& simulator)
+//         : Opm::SimulatorFullyImplicitBlackoil<TypeTag>(simulator)
+//     {}
+// };
 
 /*!
  \brief Class adding a CoSTA interface to a simulator.
@@ -38,15 +53,39 @@ class CoSTAModule
 {
 public:
     using ParameterMap = std::map<std::string, std::variant<double,std::vector<double>>>; //!< Map for parameters
+    using ModelSimulator = Opm::GetPropType<TypeTag, Opm::Properties::Simulator>;
 
     //! \brief Constructor.
     //! \param infile Input file to parse
     //! \param verbose If false, suppress stdout output
     CoSTAModule(const std::string& infile, bool verbose)
     {
-        const char* argv[] = {"opm_CoSTA", infile.c_str(), nullptr};
-        main = std::make_unique<CoSTAMain>(2, const_cast<char**>(argv));
-        main->initialize<TypeTag>();
+        const std::string verb = verbose ? "--enable-terminal-output=true"
+                                         : "--enable-terminal-output=false";
+        const std::string output_mode = verbose ? "--output-mode=all"
+                                                : "--output-mode=none";
+        const char* arg[] = {"opm_CoSTA", infile.c_str(),
+                             verb.c_str(), output_mode.c_str(),
+                             "--enable-adaptive-time-stepping=false", nullptr};
+        char** argv = const_cast<char**>(arg);
+        int argc = 5;
+
+        // read deck and initialize eclipse structures
+        main = std::make_unique<CoSTAMain>(argc, argv);
+        if (!main->initialize<TypeTag>()) {
+            throw std::runtime_error("Error initializing simulator");
+        }
+
+        Opm::FlowMain<TypeTag>::setupParameters_(argc, argv, Opm::FlowGenericVanguard::comm());
+
+        // setup the model simulator
+        msim = std::make_unique<ModelSimulator>(Opm::FlowGenericVanguard::comm(), false);
+        msim->model().applyInitialSolution();
+        sim = std::make_unique<Opm::SimulatorFullyImplicitBlackoil<TypeTag>>(*msim);
+
+        timer.init(msim->vanguard().schedule(), 0);
+        msim->setEpisodeIndex(timer.currentStepNum());
+        msim->model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
     }
 
     //! \brief Perform a prediction step in a CoSTA loop.
@@ -54,6 +93,8 @@ public:
     //! \param uprev State to make a time-step from
     std::vector<double> predict(const std::vector<double>& uprev)
     {
+        sim->init(timer);
+        sim->runStep(timer);
         return {};
     }
 
@@ -175,6 +216,9 @@ protected:
     }
 
     std::unique_ptr<CoSTAMain> main;
+    std::unique_ptr<Opm::SimulatorFullyImplicitBlackoil<TypeTag>> sim;
+    std::unique_ptr<ModelSimulator> msim;
+    Opm::SimulatorTimer timer;
 };
 
 #endif

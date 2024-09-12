@@ -36,7 +36,6 @@
 #define SUPERLU_POST_2005_VERSION 1
 /* #undef HAVE_ALGLIB */
 /* #undef HAVE_UG */
-#define HAVE_DUNE_FEM 1
 /* #undef HAVE_GRIDTYPE */
 /* #undef HAVE_GRAPE */
 /* #undef HAVE_PSURFACE */
