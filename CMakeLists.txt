@@ -17,10 +17,10 @@ find_package(pybind11 REQUIRED)
 
 pybind11_add_module(opm_CoSTA opm_CoSTA.cpp)
 target_sources(opm_CoSTA PRIVATE flow_blackoil_CoSTA.cpp
-                                 flow_onephase_CoSTA.cpp
-                                 moduleVersion.cpp 
+                                 flow_gaswater_CoSTA.cpp
+                                 ${opm-simulators_SOURCE_DIR}/opm/simulators/utils/moduleVersion.cpp
                                  CoSTAModule.hpp)
 
-target_include_directories(opm_CoSTA PRIVATE ${opm-simulators_INCLUDE_DIRS})
+target_include_directories(opm_CoSTA PRIVATE ${opm-simulators_INCLUDE_DIRS} ${opm-simulators_DIR})
 
-target_link_libraries(opm_CoSTA PUBLIC opmcommon opmgrid opmsimulators)
+target_link_libraries(opm_CoSTA PUBLIC opmsimulators opmgrid opmcommon)

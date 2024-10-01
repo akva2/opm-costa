@@ -1,0 +1,134 @@
+-- Copyright (C) 2023 NORCE
+
+----------------------------------------------------------------------------
+RUNSPEC
+----------------------------------------------------------------------------
+DIMENS 
+100 1 42 /
+
+EQLDIMS
+/
+
+-- Since this is linear flow, we use only two data points (two last items)
+TABDIMS
+4 1* 10 10 /
+
+WATER
+OIL
+GAS
+-- EK note to self: Enable CO2 store when we get to two-phase
+-- CO2STORE
+
+-- EK: Disable options for phase changes
+
+-- EK: Include molecular diffusion?
+--  DIFFUSE
+
+LAB
+
+START
+1 'JAN' 2025 /
+
+WELLDIMS
+2 42 2 2 /
+
+-- Output options
+--FMTOUT
+UNIFIN
+UNIFOUT
+----------------------------------------------------------------------------
+GRID
+----------------------------------------------------------------------------
+INIT
+INCLUDE
+'GRID.INC' /
+
+INCLUDE
+'PERM.INC' /
+
+COPY 
+PERMX PERMY /
+PERMX PERMZ /
+/
+
+INCLUDE
+'PORO.INC' /
+
+-- Define range of cells at which the free flow boundary condition should be set
+-- Tag  i_min i_max j_min j_max k_min k_max
+BCCON 
+1 1 100 1 1 42 42 Z/
+-- 1 1 100 1 1 0.616 0.616 Y/
+/
+----------------------------------------------------------------------------
+PROPS
+----------------------------------------------------------------------------
+INCLUDE
+'TABLES.INC' /
+
+-- EK: Added PVT properties
+DENSITY
+1.0 1.0 1.0 /
+
+PVDG
+1.0 1.01 1.0
+2.0 1.0 1.0 / 
+
+PVDO
+1.0 1.01 1.0
+2.0 1.0 1.0 / 
+
+PVTW
+1.0 1.0 1E-10 1 0 /
+
+----------------------------------------------------------------------------
+REGIONS
+----------------------------------------------------------------------------
+INCLUDE
+'SATNUM.INC' /
+----------------------------------------------------------------------------
+SOLUTION
+---------------------------------------------------------------------------
+
+-- Equilibration: First two items set the pressure to 1 bar at the top of the domain.
+-- The third item sets the water-tracer contact to the top of the domain.
+-- The rest is boilerplate for our purposes.
+EQUIL
+ 0.616 1.01325 0.616 0 0 0 1 1 0 /
+-- END EQUIL
+
+RPTRST
+'BASIC=2' FLOWS FLORES DEN/
+
+-- EK: Disable options for the rest of the solution section
+----------------------------------------------------------------------------
+SCHEDULE
+----------------------------------------------------------------------------
+RPTRST
+'BASIC=2' FLOWS FLORES DEN/
+
+BCPROP
+ 1 FREE /
+/
+
+--% for j in range(len(wells)):
+  -- Set the maximum time step related to wells (whatever that means) to the interval
+  -- between reporting steps
+  TUNING
+  1e-5 1* 1e-10 2* 1e-12/
+  /
+/
+
+WELSPECS
+	'well_0'	'G1'	21	1	1*	'GAS' 0.001/
+	'well_1'	'G1'	80	1	1*	'GAS' 0.001/
+/
+COMPDAT
+	'well_0'	21	1	9	9	'OPEN'	1*	1*	0.002 /
+	'well_1'	80	1	23	23	'OPEN'	1*	1*	0.002 /
+/
+
+INCLUDE 
+'WELL_RATES.INC' /
+
+--% endfor

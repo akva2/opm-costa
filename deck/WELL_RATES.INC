@@ -1,0 +1,18 @@
+WCONINJE
+'well_0' GAS OPEN RATE 8.333333333333332e-07 1* 400 /
+'well_1' GAS SHUT RATE 0.0 1* 400 /
+/
+TSTEP
+ 25*1
+/
+
+-- 25.0 minutes
+
+WCONINJE
+'well_0' GAS SHUT RATE 0.0 1* 400 /
+'well_1' GAS SHUT RATE 0.0 1* 400 /
+/
+TSTEP
+ 5*1
+/
+

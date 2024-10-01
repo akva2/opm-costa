@@ -34,15 +34,121 @@ public:
     }
 };
 
-// template<class TypeTag>
-// class CoSTASimulator : public Opm::SimulatorFullyImplicitBlackoil<TypeTag>
-// {
-//     using Simulator = Opm::GetPropType<TypeTag, Opm::Properties::Simulator>;
-// public:
-//     explicit CoSTASimulator(Simulator& simulator)
-//         : Opm::SimulatorFullyImplicitBlackoil<TypeTag>(simulator)
-//     {}
-// };
+ template<class TypeTag>
+ class CoSTASimulator : public Opm::SimulatorFullyImplicitBlackoil<TypeTag>
+ {
+    using FluidSystem = Opm::GetPropType<TypeTag, Opm::Properties::FluidSystem>;
+    using GlobalEqVec = Opm::GetPropType<TypeTag, Opm::Properties::GlobalEqVector>;
+    using Indices = Opm::GetPropType<TypeTag, Opm::Properties::Indices>;
+    using Model = typename Opm::SimulatorFullyImplicitBlackoil<TypeTag>::Model;
+    using PrimaryVariables = Opm::GetPropType<TypeTag, Opm::Properties::PrimaryVariables>;
+    using Simulator = Opm::GetPropType<TypeTag, Opm::Properties::Simulator>;
+
+    using BVector = typename Model::BVector;
+    static constexpr auto numEq = Opm::getPropValue<TypeTag, Opm::Properties::NumEq>();
+
+ public:
+    explicit CoSTASimulator(Simulator& simulator)
+        : Opm::SimulatorFullyImplicitBlackoil<TypeTag>(simulator)
+    {}
+
+    ~CoSTASimulator()
+    {
+        this->finalize();
+    }
+
+    void create()
+    {
+        this->solver_ = this->createSolver(this->wellModel_());
+    }
+
+    void updateSolution(const std::vector<double>& vec, std::size_t idx = 0)
+    {
+        auto& result = this->solver_->model().simulator().model().solution(idx);
+        auto it = vec.begin();
+        for (std::size_t i = 0; i < result.size(); ++i, it += numEq) {
+            auto& pvVars = result[i];
+            if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx) &&
+                pvVars.primaryVarsMeaningGas() != PrimaryVariables::GasMeaning::Disabled)
+            {
+                pvVars[Indices::compositionSwitchIdx] = *(it + Indices::compositionSwitchIdx);
+            }
+            if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx) &&
+                pvVars.primaryVarsMeaningWater() != PrimaryVariables::WaterMeaning::Disabled)
+            {
+                pvVars[Indices::waterSwitchIdx] = *(it + Indices::waterSwitchIdx);
+            }
+            pvVars[Indices::pressureSwitchIdx] = *(it + Indices::pressureSwitchIdx);
+        }
+
+        // unsigned nc = this->simulator_.model().numGridDof();
+        // BVector x(nc);
+        // this->solver_->model().updateSolution(x);
+    }
+
+    bool predictStep(Opm::SimulatorTimer& timer)
+    {
+        if (this->schedule().exitStatus().has_value()) {
+            if (this->terminalOutput_) {
+                Opm::OpmLog::info("Stopping simulation since EXIT was triggered by an action keyword.");
+            }
+            this->report_.success.exit_status = this->schedule().exitStatus().value();
+            return false;
+        }
+
+        // write the inital state at the report stage
+        if (timer.initialStep()) {
+            Dune::Timer perfTimer;
+            perfTimer.start();
+
+            this->simulator_.setEpisodeIndex(-1);
+            this->simulator_.setEpisodeLength(0.0);
+            this->simulator_.setTimeStepSize(0.0);
+            this->wellModel_().beginReportStep(timer.currentStepNum());
+            this->simulator_.problem().writeOutput();
+
+            this->report_.success.output_write_time += perfTimer.stop();
+        }
+
+        this->simulator_.startNextEpisode(
+            this->simulator_.startTime()
+               + this->schedule().seconds(timer.currentStepNum()),
+            timer.currentStepLength());
+        this->simulator_.setEpisodeIndex(timer.currentStepNum());
+
+        this->solver_->model().beginReportStep();
+
+        // solve for complete report step
+        this->solver_->step(timer);
+
+        return true;
+    }
+
+    auto& vanguard()
+    {
+        return this->simulator_.vanguard();
+    }
+
+    const auto& solution(std::size_t idx)
+    {
+        return this->solver_->model().simulator().model().solution(idx);
+    }
+
+    void linearize(const Opm::SimulatorTimer& timer)
+    {
+        Opm::SimulatorReportSingle dummy;
+        this->solver_->model().initialLinearization(dummy, 0, 1, 2, timer);
+    }
+
+    void correctStep(Opm::SimulatorTimer& timer)
+    {
+        this->solver_->model().nonlinearIteration(2, timer, *this->solver_);
+        this->solver_->model().afterStep(timer);
+        this->simulator_.problem().writeOutput();
+        this->solver_->model().endReportStep();
+        ++timer;
+    }
+ };
 
 /*!
  \brief Class adding a CoSTA interface to a simulator.
@@ -53,7 +159,13 @@ class CoSTAModule
 {
 public:
     using ParameterMap = std::map<std::string, std::variant<double,std::vector<double>>>; //!< Map for parameters
+    using FluidSystem = Opm::GetPropType<TypeTag, Opm::Properties::FluidSystem>;
+    using GlobalEqVec = Opm::GetPropType<TypeTag, Opm::Properties::GlobalEqVector>;
     using ModelSimulator = Opm::GetPropType<TypeTag, Opm::Properties::Simulator>;
+    using PrimaryVariables = Opm::GetPropType<TypeTag, Opm::Properties::PrimaryVariables>;
+    using SolutionVec = Opm::GetPropType<TypeTag, Opm::Properties::SolutionVector>;
+
+    static constexpr auto numEq = Opm::getPropValue<TypeTag, Opm::Properties::NumEq>();
 
     //! \brief Constructor.
     //! \param infile Input file to parse
@@ -66,9 +178,12 @@ public:
                                                 : "--output-mode=none";
         const char* arg[] = {"opm_CoSTA", infile.c_str(),
                              verb.c_str(), output_mode.c_str(),
-                             "--enable-adaptive-time-stepping=false", nullptr};
+                            "--matrix-add-well-contributions=false",
+                            "--linear-solver=cprw",
+                            "--enable-adaptive-time-stepping=0",
+                            nullptr};
         char** argv = const_cast<char**>(arg);
-        int argc = 5;
+        int argc = 7;
 
         // read deck and initialize eclipse structures
         main = std::make_unique<CoSTAMain>(argc, argv);
@@ -81,11 +196,22 @@ public:
         // setup the model simulator
         msim = std::make_unique<ModelSimulator>(Opm::FlowGenericVanguard::comm(), false);
         msim->model().applyInitialSolution();
-        sim = std::make_unique<Opm::SimulatorFullyImplicitBlackoil<TypeTag>>(*msim);
+        sim = std::make_unique<CoSTASimulator<TypeTag>>(*msim);
 
         timer.init(msim->vanguard().schedule(), 0);
         msim->setEpisodeIndex(timer.currentStepNum());
         msim->model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
+        sim->init(timer);
+        sim->create();
+
+        ndof = sim->model().simulator().model().numGridDof() * numEq;
+    }
+
+    ~CoSTAModule()
+    {
+        sim.reset();
+        msim.reset();
+        main.reset();
     }
 
     //! \brief Perform a prediction step in a CoSTA loop.
@@ -93,9 +219,12 @@ public:
     //! \param uprev State to make a time-step from
     std::vector<double> predict(const std::vector<double>& uprev)
     {
-        sim->init(timer);
-        sim->runStep(timer);
-        return {};
+        if (!timer.initialStep()) {
+            sim->updateSolution(uprev, 1);
+        }
+        sim->predictStep(timer);
+
+        return priVarsToVec(sim->model().simulator().model().solution(0));
     }
 
     //! \brief Perform a residual calculation step in a CoSTA loop.
@@ -103,10 +232,14 @@ public:
     //! \param uprev State to make a time-step from
     //! \param unext State to calculate residual for
     std::vector<double>
-    residual(const ParameterMap& mu,
+    residual(const ParameterMap&,
              const std::vector<double>& uprev, const std::vector<double>& unext)
     {
-        return {};
+        sim->updateSolution(uprev, 1);
+        sim->updateSolution(unext, 0);
+        sim->linearize(timer);
+
+        return eqVecToVec(sim->model().simulator().model().linearizer().residual());
     }
 
     //! \brief Perform a correction step in a CoSTA loop.
@@ -114,10 +247,39 @@ public:
     //! \param uprev State to make a time-step from
     //! \param sigma Right-hand-side correction to use
     std::vector<double>
-    correct(const ParameterMap& mu,
+    correct(const ParameterMap&,
             const std::vector<double>& uprev, const std::vector<double>& sigma)
     {
-        return {};
+        using Indices = Opm::GetPropType<TypeTag, Opm::Properties::Indices>;
+        sim->updateSolution(uprev, 0);
+        Opm::Source source;
+        for (std::size_t i = 0; i < ndof; ++i) {
+            const auto& pvVars = sim->solution(/*timeIdx=*/0)[i];
+            if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx) &&
+                pvVars.primaryVarsMeaningGas() != PrimaryVariables::GasMeaning::Disabled)
+            {
+                Opm::Source::SourceCell cell;
+                sim->vanguard().cartesianCoordinate(i, cell.ijk);
+                cell.component = Opm::SourceComponent::GAS;
+                cell.rate = sigma[i * numEq + Indices::compositionSwitchIdx];
+                source.addSource(cell);
+            }
+            if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx) &&
+                pvVars.primaryVarsMeaningWater() != PrimaryVariables::WaterMeaning::Disabled)
+            {
+                Opm::Source::SourceCell cell;
+                sim->vanguard().cartesianCoordinate(i, cell.ijk);
+                cell.component = Opm::SourceComponent::WATER;
+                cell.rate = sigma[i * numEq + Indices::waterSwitchIdx];
+                source.addSource(cell);
+            }
+        }
+        auto& origSource = const_cast<Opm::Source&>(sim->vanguard().schedule()[timer.currentStepNum()].source());
+        std::swap(source, origSource);
+        sim->correctStep(timer);
+        std::swap(source, origSource);
+
+        return priVarsToVec(sim->solution(0));
     }
 
     //! \brief Get the IDs of all Dirichlet DoFs.
@@ -127,14 +289,14 @@ public:
     }
 
     //! \brief Returns initial condition for solution.
-    std::vector<double> initialCondition(const ParameterMap& mu)
+    std::vector<double> initialCondition(const ParameterMap&)
     {
         return {};
     }
 
     //! \brief Returns the analytical solution.
     //! \param mu Map of parameters
-    std::map<std::string,std::vector<double>> anaSol(const ParameterMap& mu)
+    std::map<std::string,std::vector<double>> anaSol(const ParameterMap&)
     {
         return {};
     }
@@ -144,9 +306,9 @@ public:
     //! \param u Solution vector to extract QI from
     //! \param qi Name of quantity of interest
     std::vector<double>
-    getQI(const ParameterMap& mu,
-          const std::vector<double>& u,
-          const std::string& qi)
+    getQI(const ParameterMap& ,
+          const std::vector<double>&,
+          const std::string&)
     {
         return {};
     }
@@ -173,6 +335,50 @@ public:
     }
 
 protected:
+    std::vector<double> priVarsToVec(const SolutionVec& vec)
+    {
+        using Indices = Opm::GetPropType<TypeTag, Opm::Properties::Indices>;
+        std::vector<double> result(vec.size() * numEq);
+        auto it = result.begin();
+        for (std::size_t i = 0; i < vec.size(); ++i, it += numEq) {
+            const auto& pVars = vec[i];
+            if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx) &&
+                pVars.primaryVarsMeaningGas() != PrimaryVariables::GasMeaning::Disabled)
+            {
+                *(it + Indices::compositionSwitchIdx) = pVars[Indices::compositionSwitchIdx];
+            }
+            if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx) &&
+                pVars.primaryVarsMeaningWater() != PrimaryVariables::WaterMeaning::Disabled)
+            {
+                *(it + Indices::waterSwitchIdx) = pVars[Indices::waterSwitchIdx];
+            }
+            *(it + Indices::pressureSwitchIdx) = pVars[Indices::pressureSwitchIdx];
+        }
+        return result;
+    }
+
+    std::vector<double> eqVecToVec(const GlobalEqVec& vec)
+    {
+        using Indices = Opm::GetPropType<TypeTag, Opm::Properties::Indices>;
+        std::vector<double> result(vec.size() * numEq);
+        const auto& pVars = sim->solution(0)[0];
+        auto it = result.begin();
+        for (std::size_t i = 0; i < vec.size(); ++i, it += numEq) {
+            if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx) &&
+                pVars.primaryVarsMeaningGas() != PrimaryVariables::GasMeaning::Disabled)
+            {
+                *(it + Indices::compositionSwitchIdx) = vec[i][Indices::compositionSwitchIdx];
+            }
+            if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx) &&
+                pVars.primaryVarsMeaningWater() != PrimaryVariables::WaterMeaning::Disabled)
+            {
+                *(it + Indices::waterSwitchIdx) = vec[i][Indices::waterSwitchIdx];
+            }
+            *(it + Indices::pressureSwitchIdx) = vec[i][Indices::pressureSwitchIdx];
+        }
+        return result;
+    }
+
     //! \brief Get a scalar parameter from map.
     //! \param map Map with parameters
     //! \param key Name of parameter
@@ -189,7 +395,7 @@ protected:
     //! \brief Helper function to set a parameter in simulator.
     //! \param name Name of parameter
     //! \param value Value of parameter
-    void setParam(const std::string& name, double value)
+    void setParam(const std::string&, double)
     {
     }
 
@@ -216,8 +422,8 @@ protected:
     }
 
     std::unique_ptr<CoSTAMain> main;
-    std::unique_ptr<Opm::SimulatorFullyImplicitBlackoil<TypeTag>> sim;
     std::unique_ptr<ModelSimulator> msim;
+    std::unique_ptr<CoSTASimulator<TypeTag>> sim;
     Opm::SimulatorTimer timer;
 };
 
