@@ -178,8 +178,8 @@ public:
                                                 : "--output-mode=none";
         const char* arg[] = {"opm_CoSTA", infile.c_str(),
                              verb.c_str(), output_mode.c_str(),
-                            "--matrix-add-well-contributions=false",
-                            "--linear-solver=cprw",
+                            "--matrix-add-well-contributions=true",
+                            "--linear-solver=ilu0",
                             "--enable-adaptive-time-stepping=0",
                             nullptr};
         char** argv = const_cast<char**>(arg);
@@ -262,7 +262,7 @@ public:
                 sim->vanguard().cartesianCoordinate(i, cell.ijk);
                 cell.component = Opm::SourceComponent::GAS;
                 cell.rate = sigma[i * numEq + Indices::compositionSwitchIdx];
-                source.addSource(cell);
+                source.addSourceCell(cell);
             }
             if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx) &&
                 pvVars.primaryVarsMeaningWater() != PrimaryVariables::WaterMeaning::Disabled)
@@ -271,7 +271,7 @@ public:
                 sim->vanguard().cartesianCoordinate(i, cell.ijk);
                 cell.component = Opm::SourceComponent::WATER;
                 cell.rate = sigma[i * numEq + Indices::waterSwitchIdx];
-                source.addSource(cell);
+                source.addSourceCell(cell);
             }
         }
         auto& origSource = const_cast<Opm::Source&>(sim->vanguard().schedule()[timer.currentStepNum()].source());
