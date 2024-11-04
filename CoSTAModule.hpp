@@ -105,7 +105,7 @@ public:
             this->simulator_.setEpisodeLength(0.0);
             this->simulator_.setTimeStepSize(0.0);
             this->wellModel_().beginReportStep(timer.currentStepNum());
-            this->simulator_.problem().writeOutput();
+            this->simulator_.problem().writeOutput(false);
 
             this->report_.success.output_write_time += perfTimer.stop();
         }
@@ -144,7 +144,7 @@ public:
     {
         this->solver_->model().nonlinearIteration(2, timer, *this->solver_);
         this->solver_->model().afterStep(timer);
-        this->simulator_.problem().writeOutput();
+        this->simulator_.problem().writeOutput(false);
         this->solver_->model().endReportStep();
         ++timer;
     }
