@@ -201,7 +201,7 @@ public:
         timer.init(msim->vanguard().schedule(), 0);
         msim->setEpisodeIndex(timer.currentStepNum());
         msim->model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
-        sim->init(timer);
+        sim->init(timer, 0, nullptr);
         sim->create();
 
         ndof = sim->model().simulator().model().numGridDof() * numEq;
