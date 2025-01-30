@@ -5,6 +5,7 @@
 #include <pybind11/pybind11.h>
 
 #include <opm/simulators/flow/Main.hpp>
+#include <opm/simulators/flow/TTagFlowProblemTPFA.hpp>
 
 #include <opm/models/blackoil/blackoillocalresidualtpfa.hh>
 #include <opm/models/discretization/common/tpfalinearizer.hh>
