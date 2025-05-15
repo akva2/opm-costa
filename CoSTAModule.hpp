@@ -119,7 +119,7 @@ public:
         this->solver_->model().beginReportStep();
 
         // solve for complete report step
-        this->solver_->step(timer);
+        this->solver_->step(timer, nullptr);
 
         return true;
     }
