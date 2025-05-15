@@ -259,19 +259,21 @@ public:
                 pvVars.primaryVarsMeaningGas() != PrimaryVariables::GasMeaning::Disabled)
             {
                 Opm::Source::SourceCell cell;
-                sim->vanguard().cartesianCoordinate(i, cell.ijk);
+                std::array<int,3> ijk;
+                sim->vanguard().cartesianCoordinate(i, ijk);
                 cell.component = Opm::SourceComponent::GAS;
                 cell.rate = sigma[i * numEq + Indices::compositionSwitchIdx];
-                source.addSourceCell(cell);
+                source.addSourceCell(ijk, cell);
             }
             if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx) &&
                 pvVars.primaryVarsMeaningWater() != PrimaryVariables::WaterMeaning::Disabled)
             {
                 Opm::Source::SourceCell cell;
-                sim->vanguard().cartesianCoordinate(i, cell.ijk);
+                std::array<int,3> ijk;
+                sim->vanguard().cartesianCoordinate(i, ijk);
                 cell.component = Opm::SourceComponent::WATER;
                 cell.rate = sigma[i * numEq + Indices::waterSwitchIdx];
-                source.addSourceCell(cell);
+                source.addSourceCell(ijk, cell);
             }
         }
         auto& origSource = const_cast<Opm::Source&>(sim->vanguard().schedule()[timer.currentStepNum()].source());
