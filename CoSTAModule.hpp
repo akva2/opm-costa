@@ -143,7 +143,7 @@ public:
     void correctStep(Opm::SimulatorTimer& timer)
     {
         this->solver_->model().nonlinearIteration(2, timer, *this->solver_);
-        this->solver_->model().afterStep(timer);
+        this->simulator_.problem().endTimeStep();
         this->simulator_.problem().writeOutput(false);
         this->solver_->model().endReportStep();
         ++timer;
