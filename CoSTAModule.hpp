@@ -201,7 +201,11 @@ public:
         timer.init(msim->vanguard().schedule(), 0);
         msim->setEpisodeIndex(timer.currentStepNum());
         msim->model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
+#ifdef RESERVOIR_COUPLING_ENABLED
         sim->init(timer, 0, nullptr);
+#else
+        sim->init(timer);
+#endif
         sim->create();
 
         ndof = sim->model().simulator().model().numGridDof() * numEq;

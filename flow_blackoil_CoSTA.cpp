@@ -1,4 +1,7 @@
 #include "config.h" // TODO
+#ifndef HAVE_OPM_GRID
+#define HAVE_OPM_GRID 1
+#endif
 
 #include "CoSTAModule.hpp"
 
