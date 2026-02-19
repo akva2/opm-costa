@@ -257,7 +257,7 @@ public:
         using Indices = Opm::GetPropType<TypeTag, Opm::Properties::Indices>;
         sim->updateSolution(uprev, 0);
         Opm::Source source;
-        for (std::size_t i = 0; i < ndof; ++i) {
+        for (std::size_t i = 0; i < ndof / numEq; ++i) {
             const auto& pvVars = sim->solution(/*timeIdx=*/0)[i];
             if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx) &&
                 pvVars.primaryVarsMeaningGas() != PrimaryVariables::GasMeaning::Disabled)
