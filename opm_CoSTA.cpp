@@ -16,10 +16,12 @@
 
 void export_BlackOil(pybind11::module& m);
 void export_GasWater(pybind11::module& m);
+void export_OnePhase(pybind11::module& m);
 
 //! \brief Exports the opm_CoSTA python module.
 PYBIND11_MODULE(opm_CoSTA, m)
 {
     export_BlackOil(m);
     export_GasWater(m);
+    export_OnePhase(m);
 }
