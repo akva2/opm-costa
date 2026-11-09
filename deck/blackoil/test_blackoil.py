@@ -27,13 +27,11 @@ import tempfile
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from costa_check import Restriction, run  # noqa: E402
 from costa_remote import Remote  # noqa: E402
 import make_decks  # noqa: E402
 
 NSTEPS = 6
-MAX_CHOPS = 5
-DAY = 86400.0
-NEQ = 3  # equations per cell
 
 # CoSTA assumes accurate solves, far below flow's default tolerances.
 # Only the states in memory are used, so no ECL output files are written.
@@ -41,178 +39,6 @@ ARGS = ['--enable-ecl-output=false', '--linear-solver-reduction=1e-10',
         '--tolerance-cnv=1e-8', '--tolerance-cnv-relaxed=1e-8',
         '--tolerance-mb=1e-12', '--tolerance-mb-relaxed=1e-12',
         '--newton-max-iterations=30']
-
-
-def rel(a, b):
-    return np.linalg.norm(a - b) / np.linalg.norm(b)
-
-
-def flux_error(q, qstar):
-    """Max relative error over components with nonzero reference flux."""
-    q, qstar = q.reshape(-1, NEQ), qstar.reshape(-1, NEQ)
-    return max(rel(q[:, i], qstar[:, i]) for i in range(NEQ)
-               if np.linalg.norm(qstar[:, i]) > 0)
-
-
-def state_errors(u, ustar, uprev, names):
-    """Pressure error relative to the change over the step, saturations as
-    max absolute error, Rs max relative error where oil is present."""
-    n = len(names)
-    u, ustar, uprev = (x.reshape(-1, n) for x in (u, ustar, uprev))
-    var = dict(zip(names, range(n)))
-    so = 1 - ustar[:, var['sw']] - ustar[:, var['sg']]
-    errors = {}
-    for name, i in var.items():
-        if name == 'p':
-            errors[name] = rel(u[:, i], ustar[:, i]) * np.linalg.norm(ustar[:, i]) / \
-                np.linalg.norm(ustar[:, i] - uprev[:, i])
-        elif name.startswith('s'):
-            errors[name] = np.abs(u[:, i] - ustar[:, i]).max()
-        else:
-            m = so > 1e-8
-            errors[name] = np.abs(u[m, i] - ustar[m, i]).max() / np.abs(ustar[m, i]).max()
-    return errors
-
-
-def gas_present(u, names):
-    return u.reshape(-1, len(names))[:, names.index('sg')] > 0
-
-
-class Restriction:
-    """Transfer from the fine to the coarse grid, both Cartesian and all active."""
-    def __init__(self, r, fine, coarse):
-        self.fine, self.coarse = fine, coarse
-        self.names = coarse.state_vars
-        nx, ny, nz = make_decks.NX, make_decks.NY, make_decks.NZ
-        index = {tuple(c): n for n, c in enumerate(coarse.faces()['cartesian'])}
-
-        def parent(c):
-            fx, fy = nx * r, ny * r
-            i, j, k = c % fx, (c // fx) % fy, c // (fx * fy)
-            return i // r + nx * (j // r + ny * (k // r))
-        self.parent = np.array([parent(c) for c in range(nx * ny * nz * r**3)])
-        self.face_map = []  # (fine face, coarse face)
-        for f, (m, p) in enumerate(fine.faces()['cartesian']):
-            cm, cp = parent(m), parent(p)
-            if cm != cp:
-                self.face_map.append((f, index[(cm, cp)]))
-        self.ncoarse = nx * ny * nz
-        self.ncoarse_faces = len(index)
-
-    def sum(self, x, n):
-        """Sum n values per fine cell over each coarse cell."""
-        x = x.reshape(-1, n)
-        return np.column_stack([np.bincount(self.parent, x[:, i], self.ncoarse)
-                                for i in range(n)])
-
-    def state(self, u):
-        """The coarse state holding the fine component amounts, starting
-        from cell averages."""
-        n = len(self.names)
-        guess = self.sum(u, n) / np.bincount(self.parent, minlength=self.ncoarse)[:, None]
-        amounts = self.sum(np.array(self.fine.storage({}, u)), NEQ)
-        return np.array(self.coarse.state_from_storage({}, amounts.ravel(), guess.ravel()))
-
-    def flux(self, q):
-        q = q.reshape(-1, NEQ)
-        result = np.zeros((self.ncoarse_faces, NEQ))
-        for f, c in self.face_map:
-            result[c] += q[f]
-        return result.ravel()
-
-
-def run(title, truth, face, rhs, restrict_state, restrict_flux, hybrid=False):
-    names = face.state_vars
-    print(f'\n{title}: state {names}')
-    ut_prev = np.array(truth.initial_condition({}))
-    ustar_prev = restrict_state(ut_prev)
-    ok, switched_total = True, 0
-    for step in range(NSTEPS):
-        # The truth chooses the step length, and the models use the same.
-        # If the face correction fails, the step is predicted again shorter.
-        dt = 0.0
-        for chop in range(MAX_CHOPS):
-            try:
-                ut = np.array(truth.predict(ut_prev, dt))
-            except RuntimeError as e:
-                print(f'step {step}: truth failed: {e}')
-                dt /= 3
-                continue
-            dt, time = truth.attr('dt'), truth.attr('time')
-            ustar = restrict_state(ut)
-            qstar = restrict_flux(np.array(truth.fluxes({}, ut)))
-
-            p0 = np.array(face.predict(ustar_prev, dt))
-            q0 = np.array(face.fluxes({}, p0))
-
-            # Labels
-            tau = qstar - np.array(face.fluxes({}, ustar))
-            delta = np.array(face.residual({}, ustar_prev, ustar))
-            div_tau = np.array(face.divergence(tau))
-
-            # Cell correction for what face fluxes cannot represent
-            sigma = delta + div_tau if hybrid else np.zeros(0)
-            try:
-                u_face, q_face = map(np.array,
-                                     face.correct_face({}, p0, tau, sigma, strict=True))
-                break
-            except RuntimeError as e:
-                print(f'step {step}: face CoSTA failed for dt {dt / DAY:.3g} days: {e}')
-                dt /= 3
-        else:
-            print(f'{title}: FAILED, could not correct step {step}')
-            return False, ut_prev
-        balance = np.array(face.residual({}, ustar_prev, u_face)) + div_tau
-        if hybrid:
-            balance -= sigma
-        results = [('uncorrected', p0, q0), ('face CoSTA', u_face, q_face)]
-
-        p0_rhs = np.array(rhs.predict(ustar_prev, dt))
-        rhs.residual({}, ustar_prev, ustar)  # same old state as face
-        try:
-            u_rhs = np.array(rhs.correct({}, p0_rhs, delta))
-            if rhs.attr('correction')['fraction'] < 1:
-                print(f"step {step}: RHS CoSTA applied {rhs.attr('correction')['fraction']}")
-            results.append(('RHS CoSTA', u_rhs, np.array(rhs.fluxes({}, u_rhs))))
-        except RuntimeError as e:
-            print(f'step {step}: RHS CoSTA failed: {e}')
-            rhs.correct({}, p0_rhs, np.zeros(rhs.ndof))  # finish the step
-            u_rhs = None
-
-        # Steps are finished by a correction, a zero one for the truth
-        truth.correct({}, ut, np.zeros(truth.ndof))
-
-        print(f'step {step} at {time / DAY:.4g} days, dt {dt / DAY:.3g} days: '
-              f'|delta* + D tau*| / |delta*| = {rel(-div_tau, delta):.2e}')
-        if hybrid:
-            mag = np.abs(sigma.reshape(-1, NEQ)).sum(axis=1)
-            cells = np.argsort(mag)[::-1]
-            share = np.cumsum(mag[cells]) / mag.sum()
-            n99 = int(np.searchsorted(share, 0.99)) + 1
-            print(f'  sigma*: 99% in {n99} of {len(mag)} cells, largest at cells '
-                  f'{cells[:3].tolist()}')
-        errors = {}
-        for name, u, q in results:
-            errs = state_errors(u, ustar, ustar_prev, names)
-            errors[name] = flux_error(q, qstar)
-            print(f'  {name:11s}: ' + '  '.join(f'{k} {v:.2e}' for k, v in errs.items())
-                  + f'  q err {errors[name]:.2e}')
-        if u_rhs is None:
-            ok = False
-            ut_prev, ustar_prev = ut, ustar
-            continue
-        switched = int((gas_present(u_face, names) != gas_present(p0, names)).sum())
-        over_step = int((gas_present(u_face, names) !=
-                         gas_present(ustar_prev, names)).sum())
-        switched_total += switched
-        bal = np.linalg.norm(balance) / np.linalg.norm(div_tau)
-        print(f'  face CoSTA balance {bal:.2e}, switched {switched} cells, '
-              f'{over_step} over the step')
-        ok &= bal < 1e-6 and errors['face CoSTA'] < 1e-5 and errors['RHS CoSTA'] > 1e-3
-        ut_prev, ustar_prev = ut, ustar
-    ok &= switched_total > 0
-    print(f'{title}: {"PASSED" if ok else "FAILED"}')
-    return ok, ut_prev
 
 
 def robustness(truth, face, ut_prev):
@@ -248,7 +74,7 @@ def main(spe1):
         sims = [Remote('BlackOil', decks[n], ARGS)
                 for n in ('FINE', 'FINE_PERTURBED', 'FINE_PERTURBED')]
         try:
-            ok_a, ut = run('A. operator error', *sims, lambda u: u, lambda q: q)
+            ok_a, ut = run('A. operator error', *sims, NSTEPS)
             ok_a &= robustness(sims[0], sims[1], ut)
         finally:
             for sim in sims:
@@ -256,9 +82,9 @@ def main(spe1):
 
         sims = [Remote('BlackOil', decks[n], ARGS) for n in ('FINE', 'COARSE', 'COARSE')]
         try:
-            restriction = Restriction(make_decks.R, sims[0], sims[1])
-            ok_b, _ = run('B. grid error', *sims, restriction.state, restriction.flux,
-                       hybrid=True)
+            r = make_decks.R
+            restriction = Restriction(sims[0], sims[1], (r, r, r))
+            ok_b, _ = run('B. grid error', *sims, NSTEPS, restriction, hybrid=True)
         finally:
             for sim in sims:
                 sim.close()

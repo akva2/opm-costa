@@ -132,7 +132,7 @@ public:
     //! \param idx Time level
     //! \details Primary variables and their meanings are assigned by the
     //! simulator from the resulting fluid state, as for explicit initial
-    //! conditions.
+    //! conditions. Saturations are clamped to valid values.
     void updateSolution(const std::vector<double>& vec, std::size_t idx = 0)
     {
         using MaterialLaw = Opm::GetPropType<TypeTag, Opm::Properties::MaterialLaw>;
@@ -151,12 +151,14 @@ public:
             // The initial fluid state provides temperature, salt etc.
             auto fs = problem.initialFluidState(i);
             const Scalar p = *it++;
+            // States from outside, e.g. averages or predictions, may have
+            // saturations slightly outside the valid range
             Scalar sw = 0.0, sg = 0.0;
             if (FluidSystem::phaseIsActive(waterPhaseIdx) && FluidSystem::numActivePhases() > 1) {
-                sw = *it++;
+                sw = std::clamp(Scalar{*it++}, Scalar{0}, Scalar{1});
             }
             if (FluidSystem::phaseIsActive(gasPhaseIdx) && FluidSystem::phaseIsActive(oilPhaseIdx)) {
-                sg = *it++;
+                sg = std::clamp(Scalar{*it++}, Scalar{0}, Scalar{1} - sw);
             }
             else if (FluidSystem::phaseIsActive(gasPhaseIdx) &&
                      FluidSystem::phaseIsActive(waterPhaseIdx)) {
@@ -971,6 +973,16 @@ public:
           .def_readonly("ndof", &CoSTAModule<TypeTag>::ndof)
           .def_property_readonly("ncells", [](CoSTAModule<TypeTag>& self)
                                  { return self.ndof / numEq; })
+          .def_property_readonly("cartesian_dims", [](CoSTAModule<TypeTag>& self)
+                                 { return self.sim->vanguard().cartesianDimensions(); })
+          .def_property_readonly("cartesian_indices", [](CoSTAModule<TypeTag>& self)
+                                 {
+                                     std::vector<int> result(self.ndof / numEq);
+                                     for (std::size_t i = 0; i < result.size(); ++i) {
+                                         result[i] = self.sim->vanguard().cartesianIndex(i);
+                                     }
+                                     return result;
+                                 })
           .def_property_readonly_static("state_vars", [](pybind11::object)
                                         { return CoSTASimulator<TypeTag>::stateVars(); })
           .def_property_readonly("nstate", [](CoSTAModule<TypeTag>& self)
