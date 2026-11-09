@@ -451,8 +451,7 @@ public:
             try {
                 report = this->solver_->step(*substep_, nullptr);
             }
-            catch (const std::exception&) {}
-            catch (const Dune::Exception&) {}
+            catch (const std::exception&) {} // includes Dune::Exception
             if (report.converged) {
                 break;
             }
@@ -545,10 +544,7 @@ public:
                 }
             }
         }
-        catch (const std::exception&) {
-            return false;
-        }
-        catch (const Dune::Exception&) {
+        catch (const std::exception&) { // includes Dune::Exception
             return false;
         }
         return true;
