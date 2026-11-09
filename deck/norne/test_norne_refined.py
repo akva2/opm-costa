@@ -1,13 +1,19 @@
-"""Check the face CoSTA API on Norne, with a vertically refined truth.
+"""Check the face CoSTA API on Norne, with a refined truth.
 
-The truth is Norne with every layer split in two (refine_vertical.py),
-restricted mass consistently to the original grid. The wells differ
-between the grids, so face CoSTA also gets a cell correction for what
-face fluxes cannot represent, which should be localized at the wells.
+The truth is Norne refined, by default with every layer split in two
+(refine_vertical.py), restricted mass consistently to the original grid.
+The wells differ between the grids, so face CoSTA also gets a cell
+correction for what face fluxes cannot represent, which should be
+localized at the wells.
 
-Usage: python test_norne_refined.py <directory with NORNE_ATW2013.DATA> [steps]
+Usage: python test_norne_refined.py <directory with NORNE_ATW2013.DATA>
+           [--steps N] [--fine DECK --ratio RX RY RZ]
+
+--fine takes a refined deck made elsewhere, e.g. by opmt regrid, nested in
+the original grid with the given refinement ratios.
 """
 
+import argparse
 import os
 import sys
 import tempfile
@@ -31,14 +37,16 @@ ARGS = ['--enable-ecl-output=false', '--linear-solver-reduction=1e-10',
         '--newton-max-iterations=30']
 
 
-def main(norne, nsteps=NSTEPS):
+def main(norne, nsteps=NSTEPS, fine=None, ratio=(1, 1, R)):
     with tempfile.TemporaryDirectory() as tmp:
-        refine_vertical.main(os.path.join(norne, DECK), tmp, R)
-        truth = Remote('BlackOil', os.path.join(tmp, DECK), ARGS)
+        if fine is None:
+            refine_vertical.main(os.path.join(norne, DECK), tmp, R)
+            fine = os.path.join(tmp, DECK)
+        truth = Remote('BlackOil', fine, ARGS)
         face = Remote('BlackOil', os.path.join(norne, DECK), ARGS)
         rhs = Remote('BlackOil', os.path.join(norne, DECK), ARGS)
         try:
-            restriction = Restriction(truth, face, (1, 1, R))
+            restriction = Restriction(truth, face, ratio)
             # Ambiguous upwinding where a phase potential vanishes gives
             # flux errors up to about 1e-3, see test_norne.py.
             ok, _ = run('Norne, refined truth', truth, face, rhs, nsteps, restriction,
@@ -50,5 +58,12 @@ def main(norne, nsteps=NSTEPS):
 
 
 if __name__ == '__main__':
-    raise SystemExit(main(os.path.abspath(sys.argv[1]),
-                          int(sys.argv[2]) if len(sys.argv) > 2 else NSTEPS))
+    parser = argparse.ArgumentParser()
+    parser.add_argument('norne', help='directory with NORNE_ATW2013.DATA')
+    parser.add_argument('--steps', type=int, default=NSTEPS)
+    parser.add_argument('--fine', help='refined deck nested in the original')
+    parser.add_argument('--ratio', type=int, nargs=3, default=(1, 1, R),
+                        metavar=('RX', 'RY', 'RZ'))
+    a = parser.parse_args()
+    raise SystemExit(main(os.path.abspath(a.norne), a.steps,
+                          a.fine and os.path.abspath(a.fine), tuple(a.ratio)))

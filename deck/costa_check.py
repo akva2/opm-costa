@@ -57,10 +57,11 @@ class Restriction:
 
     Cells are matched by Cartesian indices, with the refinement ratio in
     each direction. States are restricted mass consistently: the coarse
-    state holds the summed component amounts of its children. A coarse cell
-    with inactive children gets its amounts scaled up, as if they had the
-    state of the active ones. Fluxes are summed over the fine connections
-    between the children of two coarse cells.
+    state holds the summed component amounts of its children, scaled by the
+    ratio of the coarse pore volume to that of its active children. This
+    accounts for inactive children, e.g. removed by MINPV, as if they had
+    the state of the active ones. Fluxes are summed over the fine
+    connections between the children of two coarse cells.
     """
     def __init__(self, fine, coarse, ratio):
         self.fine, self.coarse = fine, coarse
@@ -85,10 +86,13 @@ class Restriction:
         self.ncoarse = len(ccart)
         self.parent = parent(fine.attr('cartesian_indices'))
         self.orphans = int((self.parent < 0).sum())
-        children = np.bincount(self.parent[self.parent >= 0], minlength=self.ncoarse)
+        active = self.parent >= 0
+        children = np.bincount(self.parent[active], minlength=self.ncoarse)
         if (children == 0).any():
             raise ValueError(f'{int((children == 0).sum())} coarse cells without children')
-        self.scale = int(np.prod(ratio)) / children
+        fine_pv = np.bincount(self.parent[active],
+                              np.array(fine.attr('pore_volumes'))[active], self.ncoarse)
+        self.scale = np.array(coarse.attr('pore_volumes')) / fine_pv
         self.incomplete = int((children < np.prod(ratio)).sum())
 
         index = {tuple(c): n for n, c in enumerate(coarse.faces()['cartesian'])}
@@ -114,7 +118,9 @@ class Restriction:
     def summary(self):
         return (f'{self.orphans} fine cells without active parent, '
                 f'{self.incomplete} coarse cells with inactive children, '
-                f'{self.unmatched} fine connections without coarse connection')
+                f'{self.unmatched} fine connections without coarse connection, '
+                f'pore volume ratio coarse/fine in [{self.scale.min():.4g}, '
+                f'{self.scale.max():.4g}]')
 
     def sum(self, x, n):
         """Sum n values per fine cell over each coarse cell."""
@@ -145,8 +151,9 @@ def run(title, truth, face, rhs, nsteps, restriction=None, hybrid=False,
         flux_tol=1e-5, require_switching=True, max_chops=5):
     """Correct nsteps steps of the models with exact labels from the truth.
 
-    The truth chooses the step lengths, and the models use the same. If the
-    face correction fails, the step is predicted again shorter. With hybrid,
+    The truth chooses the step lengths, and the models use the same. If a
+    model cannot predict the step, or the face correction fails, the step is
+    predicted again shorter. With hybrid,
     face CoSTA also gets the cell correction sigma* = delta* + D tau* for
     what face fluxes cannot represent, such as differing well models.
     Returns whether the checks passed, and the last truth state.
@@ -173,7 +180,16 @@ def run(title, truth, face, rhs, nsteps, restriction=None, hybrid=False,
             ustar = restrict_state(ut)
             qstar = restrict_flux(np.array(truth.fluxes({}, ut)))
 
-            p0 = np.array(face.predict(ustar_prev, dt))
+            # The models start from the restricted truth, which they may not
+            # be able to step as far as the truth
+            try:
+                p0 = np.array(face.predict(ustar_prev, dt))
+                p0_rhs = np.array(rhs.predict(ustar_prev, dt))
+            except RuntimeError as e:
+                print(f'step {step}: model prediction failed for dt {dt / DAY:.3g} days: '
+                      f'{str(e)[:120]}')
+                dt /= 3
+                continue
             q0 = np.array(face.fluxes({}, p0))
 
             # Labels
@@ -199,7 +215,6 @@ def run(title, truth, face, rhs, nsteps, restriction=None, hybrid=False,
             balance -= sigma
         results = [('uncorrected', p0, q0), ('face CoSTA', u_face, q_face)]
 
-        p0_rhs = np.array(rhs.predict(ustar_prev, dt))
         rhs.residual({}, ustar_prev, ustar)  # same old state as face
         u_rhs = np.array(rhs.correct({}, p0_rhs, delta))
         if rhs.attr('correction')['fraction'] < 1:

@@ -458,10 +458,13 @@ public:
         const double restart = Opm::Parameters::Get<Opm::Parameters::SolverRestartFactor<Scalar>>();
         while (true) {
             Opm::SimulatorReportSingle report;
+            std::string reason = "Newton iterations did not converge";
             try {
                 report = this->solver_->step(*substep_, nullptr);
             }
-            catch (const std::exception&) {} // includes Dune::Exception
+            catch (const std::exception& e) { // includes Dune::Exception
+                reason = e.what();
+            }
             if (report.converged) {
                 break;
             }
@@ -470,7 +473,7 @@ public:
                 this->rollback();
                 substep_->setLastStepFailed(false);
                 throw std::runtime_error("Substep of " + std::to_string(failed) +
-                                         " s did not converge");
+                                         " s did not converge: " + reason);
             }
             // As for a time step chop in flow, prepareStep() restores the state
             substep_->setCurrentStepLength(restart * failed);
@@ -984,6 +987,18 @@ public:
                                  { return self.ndof / numEq; })
           .def_property_readonly("cartesian_dims", [](CoSTAModule<TypeTag>& self)
                                  { return self.sim->vanguard().cartesianDimensions(); })
+          .def_property_readonly("pore_volumes", [](CoSTAModule<TypeTag>& self)
+                                 {
+                                     // reference pore volumes, at the rock reference pressure
+                                     const auto& model = self.msim->model();
+                                     const auto& problem = self.msim->problem();
+                                     std::vector<double> result(self.ndof / numEq);
+                                     for (std::size_t i = 0; i < result.size(); ++i) {
+                                         result[i] = model.dofTotalVolume(i) *
+                                                     problem.referencePorosity(i, 0);
+                                     }
+                                     return result;
+                                 })
           .def_property_readonly("cartesian_indices", [](CoSTAModule<TypeTag>& self)
                                  {
                                      std::vector<int> result(self.ndof / numEq);
