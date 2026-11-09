@@ -35,7 +35,8 @@ PERTURBATION = '''MULTIPLY
 
 # CoSTA assumes accurate solves, far below flow's default tolerances.
 # The CNV criterion scales with dt, so short substeps need it tight.
-ARGS = ['--linear-solver-reduction=1e-12',
+# Only the states in memory are used, so no ECL output files are written.
+ARGS = ['--enable-ecl-output=false', '--linear-solver-reduction=1e-12',
         '--tolerance-cnv=1e-10', '--tolerance-cnv-relaxed=1e-10',
         '--tolerance-mb=1e-14', '--tolerance-mb-relaxed=1e-14',
         '--newton-max-iterations=30']

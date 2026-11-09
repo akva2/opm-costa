@@ -641,6 +641,10 @@ public:
     //! \param verbose If false, suppress stdout output
     //! \param args Additional command line arguments for the simulator.
     //!             These override the defaults set by the module.
+    //! \details Output files (restart, summary etc.) are written as by flow,
+    //! once per report step, next to the deck unless --output-dir is given.
+    //! Simulators in different processes sharing a deck must therefore use
+    //! different output directories, or --enable-ecl-output=false.
     CoSTAModule(const std::string& infile, bool verbose,
                 const std::vector<std::string>& args = {})
     {

@@ -36,7 +36,8 @@ DAY = 86400.0
 NEQ = 3  # equations per cell
 
 # CoSTA assumes accurate solves, far below flow's default tolerances.
-ARGS = ['--linear-solver-reduction=1e-10',
+# Only the states in memory are used, so no ECL output files are written.
+ARGS = ['--enable-ecl-output=false', '--linear-solver-reduction=1e-10',
         '--tolerance-cnv=1e-8', '--tolerance-cnv-relaxed=1e-8',
         '--tolerance-mb=1e-12', '--tolerance-mb-relaxed=1e-12',
         '--newton-max-iterations=30']
