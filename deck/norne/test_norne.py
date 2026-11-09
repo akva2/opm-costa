@@ -22,7 +22,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from costa_remote import Remote  # noqa: E402
 
 DECK = 'NORNE_ATW2013.DATA'
-NSTEPS = 5
+NSTEPS = 8
+MAX_CHOPS = 5
+DAY = 86400.0
 
 # Transmissibility perturbation of the model, added to the EDIT section
 PERTURBATION = '''MULTIPLY
@@ -113,31 +115,40 @@ def run(truth, face, rhs):
     ustar_prev = np.array(truth.initial_condition({}))
     ok = True
     for step in range(NSTEPS):
-        # Steps are finished by a correction, a zero one for the truth
-        ustar = np.array(truth.correct({}, truth.predict(ustar_prev),
-                                       np.zeros(truth.ndof)))
-        qstar = np.array(truth.fluxes({}, ustar))
+        # The truth chooses the step length, and the models use the same.
+        # If the face correction fails, the step is predicted again shorter.
+        dt = 0.0
+        for chop in range(MAX_CHOPS):
+            try:
+                ustar = np.array(truth.predict(ustar_prev, dt))
+            except RuntimeError as e:
+                print(f'step {step}: truth failed: {e}')
+                dt /= 3
+                continue
+            dt, time = truth.attr('dt'), truth.attr('time')
+            qstar = np.array(truth.fluxes({}, ustar))
 
-        p0 = np.array(face.predict(ustar_prev))
-        p0_rhs = np.array(rhs.predict(ustar_prev))
-        q0 = np.array(face.fluxes({}, p0))
+            p0 = np.array(face.predict(ustar_prev, dt))
+            q0 = np.array(face.fluxes({}, p0))
 
-        # Exact labels
-        tau = qstar - np.array(face.fluxes({}, ustar))
-        delta = np.array(face.residual({}, ustar_prev, ustar))
-        div_tau = np.array(face.divergence(tau))
+            # Exact labels
+            tau = qstar - np.array(face.fluxes({}, ustar))
+            delta = np.array(face.residual({}, ustar_prev, ustar))
+            div_tau = np.array(face.divergence(tau))
+            try:
+                u_face, q_face = map(np.array, face.correct_face({}, p0, tau))
+                break
+            except RuntimeError as e:
+                print(f'step {step}: face CoSTA failed for dt {dt / DAY:.3g} days: {e}')
+                dt /= 3
+        else:
+            print(f'FAILED, could not correct step {step}')
+            return 1
+        balance = np.array(face.residual({}, ustar_prev, u_face)) + div_tau
+
+        # RHS CoSTA, same step
+        p0_rhs = np.array(rhs.predict(ustar_prev, dt))
         rhs.residual({}, ustar_prev, ustar)  # same old state as face
-
-        # Face CoSTA
-        try:
-            u_face, q_face = map(np.array, face.correct_face({}, p0, tau))
-            balance = np.array(face.residual({}, ustar_prev, u_face)) + div_tau
-        except RuntimeError as e:
-            print(f'step {step}: face CoSTA failed: {e}')
-            face.correct({}, p0, np.zeros(face.ndof))  # finish the step
-            u_face = None
-
-        # RHS CoSTA
         try:
             u_rhs = np.array(rhs.correct({}, p0_rhs, delta))
             q_rhs = np.array(rhs.fluxes({}, u_rhs))
@@ -146,21 +157,21 @@ def run(truth, face, rhs):
             rhs.correct({}, p0_rhs, np.zeros(rhs.ndof))  # finish the step
             u_rhs = None
 
-        print(f'step {step}:')
+        # Steps are finished by a correction, a zero one for the truth
+        truth.correct({}, ustar, np.zeros(truth.ndof))
+
+        print(f'step {step} at {time / DAY:.4g} days, dt {dt / DAY:.3g} days:')
         print(f'  |delta* + D tau*| / |delta*| = {rel(-div_tau, delta):.3e}')
-        results = [('uncorrected', p0, q0)]
+        results = [('uncorrected', p0, q0), ('face CoSTA', u_face, q_face)]
         if u_rhs is not None:
             results.append(('RHS CoSTA', u_rhs, q_rhs))
-        if u_face is not None:
-            results.append(('face CoSTA', u_face, q_face))
         for name, u, q in results:
             errs = state_errors(u, ustar, ustar_prev, face.state_vars)
             print(f'  {name:11s}: ' + '  '.join(f'{k} {v:.2e}' for k, v in errs.items())
                   + f'  q err {flux_error(q, qstar):.3e}')
-        if u_face is not None:
-            print(f'  face balance |R + D tau| / |D tau| = '
-                  f'{np.linalg.norm(balance) / np.linalg.norm(div_tau):.3e}')
-        ok &= u_face is not None and u_rhs is not None and \
+        bal = np.linalg.norm(balance) / np.linalg.norm(div_tau)
+        print(f'  face balance |R + D tau| / |D tau| = {bal:.3e}')
+        ok &= u_rhs is not None and bal < 1e-6 and \
             flux_error(q_face, qstar) < 1e-5 and flux_error(q_rhs, qstar) > 1e-3
         ustar_prev = ustar
 

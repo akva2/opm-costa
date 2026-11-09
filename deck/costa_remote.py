@@ -39,6 +39,11 @@ class Remote:
             return self._recv()
         return call
 
+    def attr(self, name):
+        """Read an attribute, such as dt or time."""
+        self._conn.send((name, None))
+        return self._recv()
+
     def close(self):
         self._conn.send(None)
         self._proc.join()
@@ -55,6 +60,7 @@ def _serve(conn, variant, deck, args):
     while (msg := conn.recv()) is not None:
         name, args = msg
         try:
-            conn.send(getattr(sim, name)(*args))
+            value = getattr(sim, name)
+            conn.send(value if args is None else value(*args))
         except Exception as e:
             conn.send(e)

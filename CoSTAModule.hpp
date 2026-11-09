@@ -4,6 +4,9 @@
 #include <opm/models/parallel/threadmanager.hpp>
 #include <opm/simulators/flow/Main.hpp>
 #include <opm/simulators/flow/SimulatorFullyImplicit.hpp>
+#include <opm/simulators/timestepping/AdaptiveSimulatorTimer.hpp>
+#include <opm/simulators/timestepping/AdaptiveTimeStepping.hpp>
+#include <opm/simulators/timestepping/EclTimeSteppingParams.hpp>
 
 #include <algorithm>
 #include <array>
@@ -383,28 +386,68 @@ public:
         problem.advanceIteration();
     }
 
-    bool predictStep(Opm::SimulatorTimer& timer)
+    //! \brief Solve one substep of the current report step.
+    //! \param timer Report step timer
+    //! \param dt Substep length, if positive. Otherwise a suggested length is
+    //!           used, and chopped if the solver fails, as in flow.
+    //! \details The substep is finished by finishStep(). Until then, it can be
+    //! solved again, e.g. with a different length.
+    void predictStep(Opm::SimulatorTimer& timer, double dt)
     {
+        using Scalar = Opm::GetPropType<TypeTag, Opm::Properties::Scalar>;
+
         if (this->schedule().exitStatus().has_value()) {
-            if (this->terminalOutput_) {
-                Opm::OpmLog::info("Stopping simulation since EXIT was triggered by an action keyword.");
-            }
-            this->report_.success.exit_status = this->schedule().exitStatus().value();
-            return false;
+            throw std::runtime_error("Simulation stopped by an EXIT keyword");
         }
+
+        if (!substep_ || substep_->done()) {
+            this->beginReportStep(timer);
+        }
+
+        const double remaining = substep_->totalTime() - substep_->simulationTimeElapsed();
+        if (dt > 0.0) {
+            substep_->setCurrentStepLength(dt >= remaining * (1.0 - 1e-10) ? remaining : dt);
+        }
+        const double minDt = Opm::Parameters::Get<Opm::Parameters::SolverMinTimeStep<Scalar>>();
+        const double restart = Opm::Parameters::Get<Opm::Parameters::SolverRestartFactor<Scalar>>();
+        while (true) {
+            Opm::SimulatorReportSingle report;
+            try {
+                report = this->solver_->step(*substep_, nullptr);
+            }
+            catch (const std::exception&) {}
+            catch (const Dune::Exception&) {}
+            if (report.converged) {
+                break;
+            }
+            const double failed = substep_->currentStepLength();
+            if (dt > 0.0 || restart * failed < minDt) {
+                this->rollback();
+                substep_->setLastStepFailed(false);
+                throw std::runtime_error("Substep of " + std::to_string(failed) +
+                                         " s did not converge");
+            }
+            // As for a time step chop in flow, prepareStep() restores the state
+            substep_->setCurrentStepLength(restart * failed);
+            substep_->setLastStepFailed(true);
+        }
+        substep_->setLastStepFailed(false);
+        lastIterations_ = this->solver_->model().simulator().problem().iterationContext().iteration();
+    }
+
+    //! \brief Begin a report step, with a substep timer for it.
+    void beginReportStep(const Opm::SimulatorTimer& timer)
+    {
+        using Scalar = Opm::GetPropType<TypeTag, Opm::Properties::Scalar>;
 
         // write the inital state at the report stage
         if (timer.initialStep()) {
-            Dune::Timer perfTimer;
-            perfTimer.start();
-
             this->simulator_.setEpisodeIndex(-1);
             this->simulator_.setEpisodeLength(0.0);
             this->simulator_.setTimeStepSize(0.0);
             this->wellModel_().beginReportStep(timer.currentStepNum());
             this->simulator_.problem().writeOutput(false);
-
-            this->report_.success.output_write_time += perfTimer.stop();
+            suggestedDt_ = Opm::Parameters::Get<Opm::Parameters::InitialTimeStepInDays>() * 86400.0;
         }
 
         this->simulator_.startNextEpisode(
@@ -415,10 +458,23 @@ public:
 
         this->solver_->model().beginReportStep();
 
-        // solve for complete report step
-        this->solver_->step(timer, nullptr);
+        const double maxDt =
+            Opm::Parameters::Get<Opm::Parameters::SolverMaxTimeStepInDays<Scalar>>() * 86400.0;
+        substep_ = std::make_unique<Opm::AdaptiveSimulatorTimer>(timer.startDateTime(),
+                                                                 timer.currentStepLength(),
+                                                                 timer.simulationTimeElapsed(),
+                                                                 suggestedDt_,
+                                                                 timer.currentStepNum(),
+                                                                 maxDt);
+    }
 
-        return true;
+    //! \brief The current substep, after predictStep().
+    const Opm::AdaptiveSimulatorTimer& substep() const
+    {
+        if (!substep_) {
+            throw std::runtime_error("No current substep, call predict first");
+        }
+        return *substep_;
     }
 
     auto& vanguard()
@@ -431,17 +487,18 @@ public:
         return this->solver_->model().simulator().model().solution(idx);
     }
 
-    void linearize(const Opm::SimulatorTimer& timer)
+    void linearize()
     {
         this->restartIterations();
         Opm::SimulatorReportSingle dummy;
-        this->solver_->model().initialLinearization(dummy, 1, 2, timer);
+        this->solver_->model().initialLinearization(dummy, 1, 2, this->substep());
     }
 
     //! \brief Solve the corrected equations of the current step.
     //! \return False if the Newton iterations failed
-    bool solveCorrected(Opm::SimulatorTimer& timer)
+    bool solveCorrected()
     {
+        const auto& timer = this->substep();
         this->restartIterations();
         const auto& problem = this->simulator_.problem();
         const int maxIter = this->solver_->model().param().newton_max_iter_;
@@ -468,14 +525,36 @@ public:
         this->simulator_.problem().updateFailed();
     }
 
-    //! \brief Finish the current step.
+    //! \brief Finish the current substep, and the report step when done.
+    //! \param timer Report step timer
+    //! \details The suggested length of the next substep grows as in flow,
+    //! unless the prediction needed many Newton iterations.
     void finishStep(Opm::SimulatorTimer& timer)
     {
+        using Scalar = Opm::GetPropType<TypeTag, Opm::Properties::Scalar>;
+
         this->simulator_.problem().endTimeStep();
-        this->simulator_.problem().writeOutput(false);
-        this->solver_->model().endReportStep();
-        ++timer;
+        const double dt = substep_->currentStepLength();
+        ++(*substep_);
+
+        const double growth = Opm::Parameters::Get<Opm::Parameters::SolverGrowthFactor<Scalar>>();
+        constexpr int targetIterations = 8;
+        suggestedDt_ = lastIterations_ > targetIterations ? dt : growth * dt;
+
+        if (substep_->done()) {
+            this->simulator_.problem().writeOutput(false);
+            this->solver_->model().endReportStep();
+            ++timer;
+            // The finished substep is kept for evaluating residuals
+        } else {
+            substep_->provideTimeStepEstimate(suggestedDt_);
+        }
     }
+
+private:
+    std::unique_ptr<Opm::AdaptiveSimulatorTimer> substep_; //!< Timer for substeps of report step
+    double suggestedDt_ = 86400.0; //!< Suggested length of next substep
+    int lastIterations_ = 0; //!< Newton iterations of last prediction
  };
 
 /*!
@@ -564,16 +643,21 @@ public:
     }
 
     //! \brief Perform a prediction step in a CoSTA loop.
-    //! \param mu Model parameters
-    //! \param uprev State to make a time-step from
-    std::vector<double> predict(const std::vector<double>& uprev)
+    //! \param uprev State to make a time-step from. Ignored for the first
+    //!              step, which starts from the initial condition.
+    //! \param dt Length of the step, if positive. Otherwise the simulator
+    //!           chooses it, and chops it if the solver fails.
+    //! \details A step is a substep of a report step, see dt and time. It is
+    //! finished by a correction. Until then it can be predicted again, e.g.
+    //! with a smaller dt after a failed correction.
+    std::vector<double> predict(const std::vector<double>& uprev, double dt)
     {
-        if (!timer.initialStep()) {
+        if (started_) {
             // The step starts from uprev, and uses it as initial guess
             sim->updateSolution(uprev, 1);
             sim->updateSolution(uprev, 0);
         }
-        sim->predictStep(timer);
+        sim->predictStep(timer, dt);
 
         return sim->state();
     }
@@ -588,7 +672,7 @@ public:
     {
         sim->setOldState(uprev);
         sim->updateSolution(unext, 0);
-        sim->linearize(timer);
+        sim->linearize();
 
         return eqVecToVec(sim->model().simulator().model().linearizer().residual());
     }
@@ -778,7 +862,14 @@ public:
                pybind11::arg("verbose") = true,
                pybind11::arg("args") = std::vector<std::string>{})
           .def("correct", &CoSTAModule<TypeTag>::correct)
-          .def("predict", &CoSTAModule<TypeTag>::predict)
+          .def("predict", &CoSTAModule<TypeTag>::predict,
+               pybind11::arg("uprev"), pybind11::arg("dt") = 0.0)
+          .def_property_readonly("dt", [](CoSTAModule<TypeTag>& self)
+                                 { return self.sim->substep().currentStepLength(); })
+          .def_property_readonly("time", [](CoSTAModule<TypeTag>& self)
+                                 { return self.sim->substep().simulationTimeElapsed(); })
+          .def_property_readonly("report_step", [](CoSTAModule<TypeTag>& self)
+                                 { return self.timer.currentStepNum(); })
           .def("residual", &CoSTAModule<TypeTag>::residual)
           .def("dirichlet_dofs", &CoSTAModule<TypeTag>::dirichletDofs)
           .def("initial_condition", &CoSTAModule<TypeTag>::initialCondition)
@@ -917,7 +1008,7 @@ protected:
         Opm::Source source = this->residualToSource(sigma);
         auto& origSource = const_cast<Opm::Source&>(sim->vanguard().schedule()[timer.currentStepNum()].source());
         std::swap(source, origSource);
-        const bool converged = sim->solveCorrected(timer);
+        const bool converged = sim->solveCorrected();
         std::swap(source, origSource);
         if (!converged) {
             // The step is not finished, a new correction can be attempted
@@ -925,6 +1016,7 @@ protected:
             throw std::runtime_error("CoSTA correction did not converge");
         }
         sim->finishStep(timer);
+        started_ = true;
 
         return sim->state();
     }
@@ -990,6 +1082,7 @@ protected:
     Opm::SimulatorTimer timer;
     std::vector<Face> faces_; //!< Interior faces in face vector ordering
     std::vector<double> initial_; //!< Initial state
+    bool started_ = false; //!< True when a step has been finished
 };
 
 #endif

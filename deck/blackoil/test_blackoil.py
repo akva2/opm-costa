@@ -31,6 +31,8 @@ from costa_remote import Remote  # noqa: E402
 import make_decks  # noqa: E402
 
 NSTEPS = 6
+MAX_CHOPS = 5
+DAY = 86400.0
 NEQ = 3  # equations per cell
 
 # CoSTA assumes accurate solves, far below flow's default tolerances.
@@ -125,34 +127,46 @@ def run(title, truth, face, rhs, restrict_state, restrict_flux, hybrid=False):
     ustar_prev = restrict_state(ut_prev)
     ok, switched_total = True, 0
     for step in range(NSTEPS):
-        # Steps are finished by a correction, a zero one for the truth
-        ut = np.array(truth.correct({}, truth.predict(ut_prev), np.zeros(truth.ndof)))
-        ustar = restrict_state(ut)
-        qstar = restrict_flux(np.array(truth.fluxes({}, ut)))
+        # The truth chooses the step length, and the models use the same.
+        # If the face correction fails, the step is predicted again shorter.
+        dt = 0.0
+        for chop in range(MAX_CHOPS):
+            try:
+                ut = np.array(truth.predict(ut_prev, dt))
+            except RuntimeError as e:
+                print(f'step {step}: truth failed: {e}')
+                dt /= 3
+                continue
+            dt, time = truth.attr('dt'), truth.attr('time')
+            ustar = restrict_state(ut)
+            qstar = restrict_flux(np.array(truth.fluxes({}, ut)))
 
-        p0 = np.array(face.predict(ustar_prev))
-        p0_rhs = np.array(rhs.predict(ustar_prev))
-        q0 = np.array(face.fluxes({}, p0))
+            p0 = np.array(face.predict(ustar_prev, dt))
+            q0 = np.array(face.fluxes({}, p0))
 
-        # Labels
-        tau = qstar - np.array(face.fluxes({}, ustar))
-        delta = np.array(face.residual({}, ustar_prev, ustar))
-        div_tau = np.array(face.divergence(tau))
+            # Labels
+            tau = qstar - np.array(face.fluxes({}, ustar))
+            delta = np.array(face.residual({}, ustar_prev, ustar))
+            div_tau = np.array(face.divergence(tau))
+
+            # Cell correction for what face fluxes cannot represent
+            sigma = delta + div_tau if hybrid else np.zeros(0)
+            try:
+                u_face, q_face = map(np.array, face.correct_face({}, p0, tau, sigma))
+                break
+            except RuntimeError as e:
+                print(f'step {step}: face CoSTA failed for dt {dt / DAY:.3g} days: {e}')
+                dt /= 3
+        else:
+            print(f'{title}: FAILED, could not correct step {step}')
+            return False
+        balance = np.array(face.residual({}, ustar_prev, u_face)) + div_tau
+        if hybrid:
+            balance -= sigma
+        results = [('uncorrected', p0, q0), ('face CoSTA', u_face, q_face)]
+
+        p0_rhs = np.array(rhs.predict(ustar_prev, dt))
         rhs.residual({}, ustar_prev, ustar)  # same old state as face
-
-        results = [('uncorrected', p0, q0)]
-        # Cell correction for what face fluxes cannot represent
-        sigma = delta + div_tau if hybrid else np.zeros(0)
-        try:
-            u_face, q_face = map(np.array, face.correct_face({}, p0, tau, sigma))
-            balance = np.array(face.residual({}, ustar_prev, u_face)) + div_tau
-            if hybrid:
-                balance -= sigma
-            results.append(('face CoSTA', u_face, q_face))
-        except RuntimeError as e:
-            print(f'step {step}: face CoSTA failed: {e}')
-            face.correct({}, p0, np.zeros(face.ndof))  # finish the step
-            u_face = None
         try:
             u_rhs = np.array(rhs.correct({}, p0_rhs, delta))
             results.append(('RHS CoSTA', u_rhs, np.array(rhs.fluxes({}, u_rhs))))
@@ -161,7 +175,11 @@ def run(title, truth, face, rhs, restrict_state, restrict_flux, hybrid=False):
             rhs.correct({}, p0_rhs, np.zeros(rhs.ndof))  # finish the step
             u_rhs = None
 
-        print(f'step {step}: |delta* + D tau*| / |delta*| = {rel(-div_tau, delta):.2e}')
+        # Steps are finished by a correction, a zero one for the truth
+        truth.correct({}, ut, np.zeros(truth.ndof))
+
+        print(f'step {step} at {time / DAY:.4g} days, dt {dt / DAY:.3g} days: '
+              f'|delta* + D tau*| / |delta*| = {rel(-div_tau, delta):.2e}')
         if hybrid:
             mag = np.abs(sigma.reshape(-1, NEQ)).sum(axis=1)
             cells = np.argsort(mag)[::-1]
@@ -175,8 +193,9 @@ def run(title, truth, face, rhs, restrict_state, restrict_flux, hybrid=False):
             errors[name] = flux_error(q, qstar)
             print(f'  {name:11s}: ' + '  '.join(f'{k} {v:.2e}' for k, v in errs.items())
                   + f'  q err {errors[name]:.2e}')
-        if u_face is None or u_rhs is None:
+        if u_rhs is None:
             ok = False
+            ut_prev, ustar_prev = ut, ustar
             continue
         switched = int((gas_present(u_face, names) != gas_present(p0, names)).sum())
         over_step = int((gas_present(u_face, names) !=
