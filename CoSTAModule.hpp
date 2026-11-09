@@ -5,7 +5,9 @@
 #include <opm/simulators/flow/Main.hpp>
 #include <opm/simulators/flow/SimulatorFullyImplicit.hpp>
 
+#include <algorithm>
 #include <array>
+#include <limits>
 #include <map>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -49,6 +51,31 @@ public:
 
     using BVector = typename Model::BVector;
     static constexpr auto numEq = Opm::getPropValue<TypeTag, Opm::Properties::NumEq>();
+    static constexpr auto numPhases = FluidSystem::numPhases;
+    static constexpr auto waterPhaseIdx = FluidSystem::waterPhaseIdx;
+    static constexpr auto oilPhaseIdx = FluidSystem::oilPhaseIdx;
+    static constexpr auto gasPhaseIdx = FluidSystem::gasPhaseIdx;
+    static constexpr bool enableDissolution =
+        Indices::compositionSwitchIdx != std::numeric_limits<unsigned>::max();
+    static constexpr bool enableVapwat =
+        Opm::getPropValue<TypeTag, Opm::Properties::EnableVapwat>();
+    static constexpr bool enableDisgasInWater =
+        Opm::getPropValue<TypeTag, Opm::Properties::EnableDisgasInWater>();
+
+    //! \brief Whether a dissolution quantity is part of the state.
+    static bool hasRs() { return enableDissolution && FluidSystem::enableDissolvedGas(); }
+    static bool hasRv() { return enableDissolution && FluidSystem::enableVaporizedOil(); }
+    static bool hasRvw() { return enableVapwat && FluidSystem::enableVaporizedWater(); }
+    static bool hasRsw() { return enableDisgasInWater && FluidSystem::enableDissolvedGasInWater(); }
+
+    //! \brief The phase whose pressure is used in the physical state.
+    static unsigned referencePhase()
+    {
+        if (FluidSystem::phaseIsActive(oilPhaseIdx)) {
+            return oilPhaseIdx;
+        }
+        return FluidSystem::phaseIsActive(gasPhaseIdx) ? gasPhaseIdx : waterPhaseIdx;
+    }
 
  public:
     explicit CoSTASimulator(Simulator& simulator)
@@ -65,28 +92,155 @@ public:
         this->solver_ = this->createSolver(this->wellModel_());
     }
 
+    //! \brief Names of the physical state variables of a cell.
+    //! \details The state is independent of the primary variables used by
+    //! the simulator, whose meaning switches per cell (e.g. Sg, Rs or Rv).
+    //! The pressure is the pressure of the oil phase if active, otherwise
+    //! of the gas phase if active, otherwise of the water phase.
+    static std::vector<std::string> stateVars()
+    {
+        std::vector<std::string> result{"p"};
+        if (FluidSystem::phaseIsActive(waterPhaseIdx) && FluidSystem::numActivePhases() > 1) {
+            result.push_back("sw");
+        }
+        if (FluidSystem::phaseIsActive(gasPhaseIdx) && FluidSystem::phaseIsActive(oilPhaseIdx)) {
+            result.push_back("sg");
+        }
+        if (hasRs()) {
+            result.push_back("rs");
+        }
+        if (hasRv()) {
+            result.push_back("rv");
+        }
+        if (hasRvw()) {
+            result.push_back("rvw");
+        }
+        if (hasRsw()) {
+            result.push_back("rsw");
+        }
+        return result;
+    }
+
+    //! \brief Set the solution at a time level from a physical state.
+    //! \param vec Physical state, stateVars() values per cell
+    //! \param idx Time level
+    //! \details Primary variables and their meanings are assigned by the
+    //! simulator from the resulting fluid state, as for explicit initial
+    //! conditions.
     void updateSolution(const std::vector<double>& vec, std::size_t idx = 0)
     {
-        auto& result = this->solver_->model().simulator().model().solution(idx);
-        auto it = vec.begin();
-        for (std::size_t i = 0; i < result.size(); ++i, it += numEq) {
-            auto& pvVars = result[i];
-            if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx) &&
-                pvVars.primaryVarsMeaningGas() != PrimaryVariables::GasMeaning::Disabled)
-            {
-                pvVars[Indices::compositionSwitchIdx] = *(it + Indices::compositionSwitchIdx);
-            }
-            if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx) &&
-                pvVars.primaryVarsMeaningWater() != PrimaryVariables::WaterMeaning::Disabled)
-            {
-                pvVars[Indices::waterSwitchIdx] = *(it + Indices::waterSwitchIdx);
-            }
-            pvVars[Indices::pressureSwitchIdx] = *(it + Indices::pressureSwitchIdx);
+        using MaterialLaw = Opm::GetPropType<TypeTag, Opm::Properties::MaterialLaw>;
+        using Scalar = Opm::GetPropType<TypeTag, Opm::Properties::Scalar>;
+
+        const auto vars = stateVars();
+        const auto& problem = this->simulator_.problem();
+        auto& solution = this->simulator_.model().solution(idx);
+        if (vec.size() != solution.size() * vars.size()) {
+            throw std::runtime_error("State vector has wrong size");
         }
 
-        // unsigned nc = this->simulator_.model().numGridDof();
-        // BVector x(nc);
-        // this->solver_->model().updateSolution(x);
+        const auto refPhase = referencePhase();
+        auto it = vec.begin();
+        for (std::size_t i = 0; i < solution.size(); ++i) {
+            // The initial fluid state provides temperature, salt etc.
+            auto fs = problem.initialFluidState(i);
+            const Scalar p = *it++;
+            Scalar sw = 0.0, sg = 0.0;
+            if (FluidSystem::phaseIsActive(waterPhaseIdx) && FluidSystem::numActivePhases() > 1) {
+                sw = *it++;
+            }
+            if (FluidSystem::phaseIsActive(gasPhaseIdx) && FluidSystem::phaseIsActive(oilPhaseIdx)) {
+                sg = *it++;
+            }
+            else if (FluidSystem::phaseIsActive(gasPhaseIdx) &&
+                     FluidSystem::phaseIsActive(waterPhaseIdx)) {
+                sg = 1.0 - sw;
+            }
+            if (FluidSystem::numActivePhases() == 1) {
+                sw = sg = 1.0;
+            }
+            if (FluidSystem::phaseIsActive(waterPhaseIdx)) {
+                fs.setSaturation(waterPhaseIdx, sw);
+            }
+            if (FluidSystem::phaseIsActive(gasPhaseIdx)) {
+                fs.setSaturation(gasPhaseIdx, sg);
+            }
+            if (FluidSystem::phaseIsActive(oilPhaseIdx)) {
+                fs.setSaturation(oilPhaseIdx, FluidSystem::numActivePhases() == 1
+                                                  ? 1.0 : 1.0 - sw - sg);
+            }
+
+            std::array<Scalar, numPhases> pc{};
+            MaterialLaw::capillaryPressures(pc, problem.materialLawParams(i), fs);
+            for (unsigned phaseIdx = 0; phaseIdx < numPhases; ++phaseIdx) {
+                if (FluidSystem::phaseIsActive(phaseIdx)) {
+                    fs.setPressure(phaseIdx, p + (pc[phaseIdx] - pc[refPhase]));
+                }
+            }
+
+            // Storage for these only exist in the fluid state if compiled in
+            if constexpr (enableDissolution) {
+                if (hasRs()) {
+                    fs.setRs(*it++);
+                }
+                if (hasRv()) {
+                    fs.setRv(*it++);
+                }
+            }
+            if constexpr (enableVapwat) {
+                if (hasRvw()) {
+                    fs.setRvw(*it++);
+                }
+            }
+            if constexpr (enableDisgasInWater) {
+                if (hasRsw()) {
+                    fs.setRsw(*it++);
+                }
+            }
+
+            solution[i].assignNaive(fs);
+        }
+
+        // The linearizer uses cached intensive quantities, which the
+        // simulator only refreshes after its own Newton updates.
+        if (idx == 0) {
+            this->simulator_.model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
+        }
+    }
+
+    //! \brief Get the physical state of the current solution.
+    //! \return stateVars() values per cell
+    std::vector<double> state()
+    {
+        auto& model = this->simulator_.model();
+        model.invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
+
+        const auto refPhase = referencePhase();
+        std::vector<double> result;
+        result.reserve(model.numGridDof() * stateVars().size());
+        for (unsigned i = 0; i < model.numGridDof(); ++i) {
+            const auto& fs = model.intensiveQuantities(i, /*timeIdx=*/0).fluidState();
+            result.push_back(Opm::getValue(fs.pressure(refPhase)));
+            if (FluidSystem::phaseIsActive(waterPhaseIdx) && FluidSystem::numActivePhases() > 1) {
+                result.push_back(Opm::getValue(fs.saturation(waterPhaseIdx)));
+            }
+            if (FluidSystem::phaseIsActive(gasPhaseIdx) && FluidSystem::phaseIsActive(oilPhaseIdx)) {
+                result.push_back(Opm::getValue(fs.saturation(gasPhaseIdx)));
+            }
+            if (hasRs()) {
+                result.push_back(Opm::getValue(fs.Rs()));
+            }
+            if (hasRv()) {
+                result.push_back(Opm::getValue(fs.Rv()));
+            }
+            if (hasRvw()) {
+                result.push_back(Opm::getValue(fs.Rvw()));
+            }
+            if (hasRsw()) {
+                result.push_back(Opm::getValue(fs.Rsw()));
+            }
+        }
+        return result;
     }
 
     //! \brief Set the state at the start of the time step.
@@ -110,7 +264,6 @@ public:
         // Evaluate the storage of the old state using the time level 0 cache
         const auto current = model.solution(0);
         this->updateSolution(vec, 0);
-        model.invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
         for (unsigned i = 0; i < model.numGridDof(); ++i) {
             EqVector storage;
             LocalResidual::template computeStorage<Scalar>(storage,
@@ -189,14 +342,39 @@ public:
         this->solver_->model().initialLinearization(dummy, 1, 2, timer);
     }
 
-    void correctStep(Opm::SimulatorTimer& timer)
+    //! \brief Solve the corrected equations of the current step.
+    //! \return False if the Newton iterations failed
+    bool solveCorrected(Opm::SimulatorTimer& timer)
     {
         this->restartIterations();
         const auto& problem = this->simulator_.problem();
         const int maxIter = this->solver_->model().param().newton_max_iter_;
-        while (!this->solver_->model().nonlinearIteration(timer, *this->solver_).converged &&
-               problem.iterationContext().iteration() <= maxIter)
-        {}
+        try {
+            while (!this->solver_->model().nonlinearIteration(timer, *this->solver_).converged) {
+                if (problem.iterationContext().iteration() > maxIter) {
+                    return false;
+                }
+            }
+        }
+        catch (const std::exception&) {
+            return false;
+        }
+        catch (const Dune::Exception&) {
+            return false;
+        }
+        return true;
+    }
+
+    //! \brief Reset to the start of the step after failed Newton iterations.
+    //! \details As for a time step chop, this restores the solution and wells.
+    void rollback()
+    {
+        this->simulator_.problem().updateFailed();
+    }
+
+    //! \brief Finish the current step.
+    void finishStep(Opm::SimulatorTimer& timer)
+    {
         this->simulator_.problem().endTimeStep();
         this->simulator_.problem().writeOutput(false);
         this->solver_->model().endReportStep();
@@ -224,7 +402,8 @@ public:
     //! \brief Constructor.
     //! \param infile Input file to parse
     //! \param verbose If false, suppress stdout output
-    //! \param args Additional command line arguments for the simulator
+    //! \param args Additional command line arguments for the simulator.
+    //!             These override the defaults set by the module.
     CoSTAModule(const std::string& infile, bool verbose,
                 const std::vector<std::string>& args = {})
     {
@@ -232,11 +411,21 @@ public:
                                          : "--enable-terminal-output=false";
         const std::string output_mode = verbose ? "--output-mode=all"
                                                 : "--output-mode=none";
-        std::vector<const char*> arg = {"opm_CoSTA", infile.c_str(),
-                                        verb.c_str(), output_mode.c_str(),
-                                        "--matrix-add-well-contributions=true",
-                                        "--linear-solver=ilu0",
-                                        "--enable-adaptive-time-stepping=0"};
+        const std::vector<std::string> defaults = {verb, output_mode,
+                                                   "--matrix-add-well-contributions=true",
+                                                   "--linear-solver=ilu0",
+                                                   "--enable-adaptive-time-stepping=0"};
+        // Options given in args override the defaults
+        const auto key = [](const std::string& option)
+                         { return option.substr(0, option.find('=')); };
+        std::vector<const char*> arg = {"opm_CoSTA", infile.c_str()};
+        for (const auto& option : defaults) {
+            if (std::none_of(args.begin(), args.end(),
+                             [&](const std::string& a) { return key(a) == key(option); }))
+            {
+                arg.push_back(option.c_str());
+            }
+        }
         for (const auto& a : args) {
             arg.push_back(a.c_str());
         }
@@ -268,6 +457,7 @@ public:
         sim->create();
 
         ndof = sim->model().simulator().model().numGridDof() * numEq;
+        initial_ = sim->state();
     }
 
     ~CoSTAModule()
@@ -289,7 +479,7 @@ public:
         }
         sim->predictStep(timer);
 
-        return priVarsToVec(sim->model().simulator().model().solution(0));
+        return sim->state();
     }
 
     //! \brief Perform a residual calculation step in a CoSTA loop.
@@ -323,7 +513,9 @@ public:
     //! its \a plus cell (minus < plus in active cell numbering). A positive
     //! flux means flow from minus to plus. The ordering of the returned
     //! arrays defines the ordering of all face vectors (fluxes, tau).
-    //! Boundary faces are not included (no-flow boundaries).
+    //! Boundary faces are not included (no-flow boundaries). Non-neighbor
+    //! connections are included. The direction is the FaceDir::DirEnum value
+    //! of the face seen from the minus cell (0 if unknown).
     pybind11::dict faces()
     {
         this->ensureFaces();
@@ -364,7 +556,6 @@ public:
     fluxes(const ParameterMap&, const std::vector<double>& u)
     {
         sim->updateSolution(u, 0);
-        sim->model().simulator().model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
 
         return this->computeFluxes();
     }
@@ -424,7 +615,7 @@ public:
     //! \brief Returns initial condition for solution.
     std::vector<double> initialCondition(const ParameterMap&)
     {
-        return {};
+        return initial_;
     }
 
     //! \brief Returns the analytical solution.
@@ -446,7 +637,9 @@ public:
         return {};
     }
 
-    size_t ndof; //!< Number of degrees of freedom in simulator
+    //! Number of equations in simulator, i.e. the size of residuals and
+    //! residual corrections. States have nstate = ncells * state_vars entries.
+    size_t ndof;
 
     //! \brief Static helper to export to python.
     //! \param m Module to export to
@@ -471,7 +664,14 @@ public:
           .def("correct_face", &CoSTAModule<TypeTag>::correctFace)
           .def_property_readonly("nfaces", [](CoSTAModule<TypeTag>& self)
                                  { self.ensureFaces(); return self.faces_.size(); })
-          .def_readonly("ndof", &CoSTAModule<TypeTag>::ndof);
+          .def_readonly("ndof", &CoSTAModule<TypeTag>::ndof)
+          .def_property_readonly("ncells", [](CoSTAModule<TypeTag>& self)
+                                 { return self.ndof / numEq; })
+          .def_property_readonly_static("state_vars", [](pybind11::object)
+                                        { return CoSTASimulator<TypeTag>::stateVars(); })
+          .def_property_readonly("nstate", [](CoSTAModule<TypeTag>& self)
+                                 { return self.ndof / numEq *
+                                          CoSTASimulator<TypeTag>::stateVars().size(); });
     }
 
 protected:
@@ -587,52 +787,27 @@ protected:
         Opm::Source source = this->residualToSource(sigma);
         auto& origSource = const_cast<Opm::Source&>(sim->vanguard().schedule()[timer.currentStepNum()].source());
         std::swap(source, origSource);
-        sim->correctStep(timer);
+        const bool converged = sim->solveCorrected(timer);
         std::swap(source, origSource);
-
-        return priVarsToVec(sim->solution(0));
-    }
-
-    std::vector<double> priVarsToVec(const SolutionVec& vec)
-    {
-        using Indices = Opm::GetPropType<TypeTag, Opm::Properties::Indices>;
-        std::vector<double> result(vec.size() * numEq);
-        auto it = result.begin();
-        for (std::size_t i = 0; i < vec.size(); ++i, it += numEq) {
-            const auto& pVars = vec[i];
-            if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx) &&
-                pVars.primaryVarsMeaningGas() != PrimaryVariables::GasMeaning::Disabled)
-            {
-                *(it + Indices::compositionSwitchIdx) = pVars[Indices::compositionSwitchIdx];
-            }
-            if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx) &&
-                pVars.primaryVarsMeaningWater() != PrimaryVariables::WaterMeaning::Disabled)
-            {
-                *(it + Indices::waterSwitchIdx) = pVars[Indices::waterSwitchIdx];
-            }
-            *(it + Indices::pressureSwitchIdx) = pVars[Indices::pressureSwitchIdx];
+        if (!converged) {
+            // The step is not finished, a new correction can be attempted
+            sim->rollback();
+            throw std::runtime_error("CoSTA correction did not converge");
         }
-        return result;
+        sim->finishStep(timer);
+
+        return sim->state();
     }
 
+    //! \brief Convert a residual to a vector with numEq values per cell.
     std::vector<double> eqVecToVec(const GlobalEqVec& vec)
     {
-        using Indices = Opm::GetPropType<TypeTag, Opm::Properties::Indices>;
-        std::vector<double> result(vec.size() * numEq);
-        const auto& pVars = sim->solution(0)[0];
-        auto it = result.begin();
-        for (std::size_t i = 0; i < vec.size(); ++i, it += numEq) {
-            if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx) &&
-                pVars.primaryVarsMeaningGas() != PrimaryVariables::GasMeaning::Disabled)
-            {
-                *(it + Indices::compositionSwitchIdx) = vec[i][Indices::compositionSwitchIdx];
+        std::vector<double> result;
+        result.reserve(vec.size() * numEq);
+        for (std::size_t i = 0; i < vec.size(); ++i) {
+            for (unsigned eq = 0; eq < numEq; ++eq) {
+                result.push_back(vec[i][eq]);
             }
-            if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx) &&
-                pVars.primaryVarsMeaningWater() != PrimaryVariables::WaterMeaning::Disabled)
-            {
-                *(it + Indices::waterSwitchIdx) = vec[i][Indices::waterSwitchIdx];
-            }
-            *(it + Indices::pressureSwitchIdx) = vec[i][Indices::pressureSwitchIdx];
         }
         return result;
     }
@@ -684,6 +859,7 @@ protected:
     std::unique_ptr<CoSTASimulator<TypeTag>> sim;
     Opm::SimulatorTimer timer;
     std::vector<Face> faces_; //!< Interior faces in face vector ordering
+    std::vector<double> initial_; //!< Initial state
 };
 
 #endif

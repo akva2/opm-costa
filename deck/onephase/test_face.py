@@ -9,9 +9,13 @@ verify the properties from the face CoSTA description:
  * correct() (RHS CoSTA) recovers p*, but not Q*.
 """
 
-import multiprocessing as mp
+import os
+import sys
 
 import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from costa_remote import Remote  # noqa: E402
 
 R = 4                  # coarsening ratio in both directions
 NXC, NYC = 8, 4        # coarse grid
@@ -45,47 +49,6 @@ def restrict_flux(fine_faces, coarse_faces, qf):
     return q
 
 
-class Remote:
-    """Run a simulator in a separate process.
-
-    OPM keeps global state, so only one simulator can live in a process.
-    Method calls are forwarded to the process.
-    """
-    def __init__(self, deck):
-        self._conn, child = mp.Pipe()
-        self._proc = mp.get_context('spawn').Process(target=Remote._serve,
-                                                     args=(child, deck))
-        self._proc.start()
-        self.ndof, self.nfaces = self._recv()
-
-    def _recv(self, timeout=300):
-        if not self._conn.poll(timeout):
-            self._proc.kill()
-            raise RuntimeError('simulator process did not respond')
-        return self._conn.recv()
-
-    @staticmethod
-    def _serve(conn, deck):
-        import opm_CoSTA
-        sim = opm_CoSTA.OnePhase(deck, False, ARGS)
-        conn.send((sim.ndof, sim.nfaces))
-        while (msg := conn.recv()) is not None:
-            name, args = msg
-            conn.send(getattr(sim, name)(*args))
-
-    def __getattr__(self, name):
-        if name.startswith('_'):
-            raise AttributeError(name)
-        def call(*args):
-            self._conn.send((name, args))
-            return self._recv()
-        return call
-
-    def close(self):
-        self._conn.send(None)
-        self._proc.join()
-
-
 def rel(a, b):
     return np.linalg.norm(a - b) / np.linalg.norm(b)
 
@@ -96,18 +59,19 @@ def perr(p, pstar):
 
 
 def main():
-    fine = Remote('FINE')
-    face = Remote('COARSE')    # face CoSTA instance
-    rhs = Remote('COARSE')     # RHS CoSTA instance
+    fine = Remote('OnePhase', 'FINE', ARGS)
+    face = Remote('OnePhase', 'COARSE', ARGS)    # face CoSTA instance
+    rhs = Remote('OnePhase', 'COARSE', ARGS)     # RHS CoSTA instance
     ffaces, cfaces = fine.faces(), face.faces()
     print(f'fine: {fine.ndof} cells, {fine.nfaces} faces; '
           f'coarse: {face.ndof} cells, {face.nfaces} faces')
 
     uf = np.zeros(fine.ndof)
-    pstar_prev = np.full(face.ndof, P_INIT)
+    pstar_prev = np.array(face.initial_condition({}))
     ok = True
     for step in range(NSTEPS):
-        uf = np.array(fine.predict(uf))
+        # Steps are finished by a correction, a zero one for the fine grid
+        uf = np.array(fine.correct({}, fine.predict(uf), np.zeros(fine.ndof)))
         qf = np.array(fine.fluxes({}, uf))
         pstar = restrict_pressure(uf)
         qstar = restrict_flux(ffaces, cfaces, qf)
