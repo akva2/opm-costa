@@ -246,6 +246,39 @@ public:
         return result;
     }
 
+    //! \brief The current state of the wells.
+    //! \return A dict per well with name, status, control mode, bhp, thp,
+    //! surface rates per active phase and the perforated cells
+    pybind11::list wells()
+    {
+        const auto& wellState = this->wellModel_().wellState();
+        std::vector<std::string> phases;
+        for (unsigned i = 0; i < FluidSystem::numActivePhases(); ++i) {
+            phases.emplace_back(FluidSystem::phaseName(FluidSystem::activeToCanonicalPhaseIdx(i)));
+        }
+        pybind11::list result;
+        for (std::size_t w = 0; w < wellState.size(); ++w) {
+            const auto& well = wellState.well(w);
+            pybind11::dict entry;
+            entry["name"] = well.name;
+            entry["producer"] = well.producer;
+            entry["status"] = Opm::WellStatus2String(well.status);
+            entry["control"] = well.producer
+                ? Opm::WellProducerCMode2String(well.production_cmode)
+                : Opm::WellInjectorCMode2String(well.injection_cmode);
+            entry["bhp"] = well.bhp;
+            entry["thp"] = well.thp;
+            pybind11::dict rates;
+            for (std::size_t i = 0; i < phases.size(); ++i) {
+                rates[pybind11::str(phases[i])] = well.surface_rates[i];
+            }
+            entry["rates"] = rates;
+            entry["cells"] = well.perf_data.cell_index;
+            result.append(entry);
+        }
+        return result;
+    }
+
     //! \brief Component amounts in each cell for a physical state.
     //! \param vec Physical state, stateVars() values per cell
     //! \return Storage times cell volume, numEq values per cell, in the
@@ -879,6 +912,7 @@ public:
           .def("fluxes", &CoSTAModule<TypeTag>::fluxes)
           .def("divergence", &CoSTAModule<TypeTag>::divergence)
           .def("storage", &CoSTAModule<TypeTag>::storage)
+          .def("wells", [](CoSTAModule<TypeTag>& self) { return self.sim->wells(); })
           .def("state_from_storage", &CoSTAModule<TypeTag>::stateFromStorage)
           .def("correct_face", &CoSTAModule<TypeTag>::correctFace,
                pybind11::arg("mu"), pybind11::arg("uprev"), pybind11::arg("tau"),
