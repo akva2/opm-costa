@@ -10,10 +10,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -551,6 +554,36 @@ public:
         return true;
     }
 
+    //! \brief Worst converged cells in the last linearization.
+    //! \param maxCount Maximum number of cells to return
+    //! \return Cells with their CNV value, max over equations of
+    //! |residual| * dt / pore volume, worst first. Non-finite residuals
+    //! give an infinite value.
+    std::vector<std::pair<unsigned, double>> failedCells(std::size_t maxCount) const
+    {
+        const auto& model = this->simulator_.model();
+        const auto& problem = this->simulator_.problem();
+        const auto& residual = model.linearizer().residual();
+        const double dt = this->simulator_.timeStepSize();
+        std::vector<std::pair<unsigned, double>> result;
+        for (unsigned i = 0; i < residual.size(); ++i) {
+            const double pv = model.dofTotalVolume(i) * problem.referencePorosity(i, 0);
+            double cnv = 0.0;
+            for (unsigned eq = 0; eq < numEq; ++eq) {
+                const double value = std::abs(residual[i][eq]) * dt / pv;
+                cnv = std::isfinite(value) ? std::max(cnv, value)
+                                           : std::numeric_limits<double>::infinity();
+            }
+            result.emplace_back(i, cnv);
+        }
+        std::sort(result.begin(), result.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        if (result.size() > maxCount) {
+            result.resize(maxCount);
+        }
+        return result;
+    }
+
     //! \brief Reset to the start of the step after failed Newton iterations.
     //! \details As for a time step chop, this restores the solution and wells.
     void rollback()
@@ -714,11 +747,14 @@ public:
     //! \param mu Model parameters
     //! \param uprev State to make a time-step from
     //! \param sigma Right-hand-side correction to use
+    //! \param strict If true, raise if the correction fails. Otherwise the
+    //!               correction is applied partially or not at all, see
+    //!               correction for the outcome.
     std::vector<double>
     correct(const ParameterMap&,
-            const std::vector<double>& uprev, const std::vector<double>& sigma)
+            const std::vector<double>& uprev, const std::vector<double>& sigma, bool strict)
     {
-        return this->correctImpl(uprev, sigma);
+        return this->correctImpl(uprev, sigma, strict);
     }
 
     //! \brief Returns the active interior faces used by the face-based CoSTA API.
@@ -820,6 +856,7 @@ public:
     //! \param tau Face flux correction, ordered as faces()
     //! \param sigma Optional residual correction, numEq values per cell,
     //!              as for correct(). Empty for none.
+    //! \param strict If true, raise if the correction fails, see correct()
     //! \return Tuple of corrected state and corrected fluxes, q = Q(u) + tau
     //! \details The correction tau is added to every face flux, which is
     //! equivalent to the cell source -D*tau. The returned fluxes therefore
@@ -829,7 +866,7 @@ public:
     std::tuple<std::vector<double>, std::vector<double>>
     correctFace(const ParameterMap&,
                 const std::vector<double>& uprev, const std::vector<double>& tau,
-                const std::vector<double>& sigma)
+                const std::vector<double>& sigma, bool strict)
     {
         std::vector<double> total = this->divergence(tau);
         if (!sigma.empty() && sigma.size() != total.size()) {
@@ -838,13 +875,14 @@ public:
         for (std::size_t i = 0; i < total.size(); ++i) {
             total[i] = (sigma.empty() ? 0.0 : sigma[i]) - total[i];
         }
-        auto u = this->correctImpl(uprev, total);
+        auto u = this->correctImpl(uprev, total, strict);
 
-        // Fluxes are evaluated at the corrected state.
+        // Fluxes are evaluated at the corrected state, with the applied
+        // fraction of the correction.
         sim->model().simulator().model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
         auto q = this->computeFluxes();
         for (std::size_t i = 0; i < q.size(); ++i) {
-            q[i] += tau[i];
+            q[i] += correction_.fraction * tau[i];
         }
         return {u, q};
     }
@@ -894,7 +932,17 @@ public:
                pybind11::arg("infile"),
                pybind11::arg("verbose") = true,
                pybind11::arg("args") = std::vector<std::string>{})
-          .def("correct", &CoSTAModule<TypeTag>::correct)
+          .def("correct", &CoSTAModule<TypeTag>::correct,
+               pybind11::arg("mu"), pybind11::arg("uprev"), pybind11::arg("sigma"),
+               pybind11::arg("strict") = false)
+          .def_property_readonly("correction", [](CoSTAModule<TypeTag>& self)
+                                 {
+                                     pybind11::dict result;
+                                     result["fraction"] = self.correction_.fraction;
+                                     result["attempts"] = self.correction_.attempts;
+                                     result["failed_cells"] = self.correction_.failedCells;
+                                     return result;
+                                 })
           .def("predict", &CoSTAModule<TypeTag>::predict,
                pybind11::arg("uprev"), pybind11::arg("dt") = 0.0)
           .def_property_readonly("dt", [](CoSTAModule<TypeTag>& self)
@@ -916,7 +964,8 @@ public:
           .def("state_from_storage", &CoSTAModule<TypeTag>::stateFromStorage)
           .def("correct_face", &CoSTAModule<TypeTag>::correctFace,
                pybind11::arg("mu"), pybind11::arg("uprev"), pybind11::arg("tau"),
-               pybind11::arg("sigma") = std::vector<double>{})
+               pybind11::arg("sigma") = std::vector<double>{},
+               pybind11::arg("strict") = false)
           .def_property_readonly("nfaces", [](CoSTAModule<TypeTag>& self)
                                  { self.ensureFaces(); return self.faces_.size(); })
           .def_readonly("ndof", &CoSTAModule<TypeTag>::ndof)
@@ -1032,22 +1081,97 @@ protected:
         return source;
     }
 
-    //! \brief Perform a correction step with a residual correction.
-    //! \param uprev State to make a time-step from
-    //! \param sigma Residual correction, numEq values per cell
-    std::vector<double>
-    correctImpl(const std::vector<double>& uprev, const std::vector<double>& sigma)
+    //! \brief Outcome of the last correction.
+    struct CorrectionInfo
     {
-        sim->updateSolution(uprev, 0);
-        Opm::Source source = this->residualToSource(sigma);
+        double fraction = 1.0; //!< Fraction of the correction applied
+        int attempts = 0; //!< Number of corrected solves attempted
+        //! Worst converged cells of the first failed attempt: cell, Cartesian
+        //! index, CNV value
+        std::vector<std::tuple<unsigned, int, double>> failedCells;
+    };
+
+    //! \brief Perform a correction step with a residual correction.
+    //! \param guess Initial guess for the solution
+    //! \param sigma Residual correction, numEq values per cell
+    //! \param strict If true, raise if the correction fails
+    //! \details If the corrected solve fails, it is retried from the state
+    //! at the start of the step. If that fails too, the correction is
+    //! applied gradually, keeping the largest converged fraction, down to
+    //! the uncorrected solution as last resort, unless strict. Failed
+    //! attempts are rolled back as a chopped time step.
+    std::vector<double>
+    correctImpl(const std::vector<double>& guess, const std::vector<double>& sigma, bool strict)
+    {
+        using SolutionVector = Opm::GetPropType<TypeTag, Opm::Properties::SolutionVector>;
+        constexpr double minFraction = 1.0 / 16;
+        constexpr std::size_t maxFailedCells = 10;
+
+        auto& model = msim->model();
+        sim->updateSolution(guess, 0);
+        const SolutionVector guessSolution = model.solution(0);
+        const SolutionVector startSolution = model.solution(1);
         auto& origSource = const_cast<Opm::Source&>(sim->vanguard().schedule()[timer.currentStepNum()].source());
-        std::swap(source, origSource);
-        const bool converged = sim->solveCorrected();
-        std::swap(source, origSource);
+
+        correction_ = CorrectionInfo{};
+        const auto attempt = [&](double fraction, const SolutionVector& start)
+        {
+            ++correction_.attempts;
+            model.solution(0) = start;
+            model.invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
+            std::vector<double> scaled(sigma);
+            for (auto& s : scaled) {
+                s *= fraction;
+            }
+            Opm::Source source = this->residualToSource(scaled);
+            std::swap(source, origSource);
+            const bool converged = sim->solveCorrected();
+            std::swap(source, origSource);
+            if (!converged) {
+                if (correction_.failedCells.empty()) {
+                    for (const auto& [cell, cnv] : sim->failedCells(maxFailedCells)) {
+                        correction_.failedCells.emplace_back(cell,
+                                                             sim->vanguard().cartesianIndex(cell),
+                                                             cnv);
+                    }
+                }
+                sim->rollback();
+            }
+            return converged;
+        };
+
+        bool converged = attempt(1.0, guessSolution) || attempt(1.0, startSolution);
+        if (!converged && strict) {
+            std::ostringstream message;
+            message << "CoSTA correction did not converge, failed cells:" << std::setprecision(3);
+            for (const auto& [cell, cart, cnv] : correction_.failedCells) {
+                message << ' ' << cell << " (CNV " << cnv << ')';
+            }
+            throw std::runtime_error(message.str());
+        }
         if (!converged) {
-            // The step is not finished, a new correction can be attempted
-            sim->rollback();
-            throw std::runtime_error("CoSTA correction did not converge");
+            // Apply the correction gradually from the uncorrected solution
+            double done = 0.0;
+            double step = 0.5;
+            bool lastConverged = false;
+            SolutionVector last = guessSolution;
+            while (done < 1.0 && step >= minFraction) {
+                const double fraction = std::min(1.0, done + step);
+                lastConverged = attempt(fraction, last);
+                if (lastConverged) {
+                    done = fraction;
+                    last = model.solution(0);
+                } else {
+                    step /= 2;
+                }
+            }
+            // Restore the solution of the largest converged fraction
+            if (!lastConverged && !attempt(done, last)) {
+                throw std::runtime_error("CoSTA correction failed, also without correction");
+            }
+            correction_.fraction = done;
+            Opm::OpmLog::warning("CoSTA correction did not converge, applied fraction " +
+                                 std::to_string(done));
         }
         sim->finishStep(timer);
         started_ = true;
@@ -1117,6 +1241,7 @@ protected:
     std::vector<Face> faces_; //!< Interior faces in face vector ordering
     std::vector<double> initial_; //!< Initial state
     bool started_ = false; //!< True when a step has been finished
+    CorrectionInfo correction_; //!< Outcome of the last correction
 };
 
 #endif

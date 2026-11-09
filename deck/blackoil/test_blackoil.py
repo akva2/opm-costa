@@ -152,14 +152,15 @@ def run(title, truth, face, rhs, restrict_state, restrict_flux, hybrid=False):
             # Cell correction for what face fluxes cannot represent
             sigma = delta + div_tau if hybrid else np.zeros(0)
             try:
-                u_face, q_face = map(np.array, face.correct_face({}, p0, tau, sigma))
+                u_face, q_face = map(np.array,
+                                     face.correct_face({}, p0, tau, sigma, strict=True))
                 break
             except RuntimeError as e:
                 print(f'step {step}: face CoSTA failed for dt {dt / DAY:.3g} days: {e}')
                 dt /= 3
         else:
             print(f'{title}: FAILED, could not correct step {step}')
-            return False
+            return False, ut_prev
         balance = np.array(face.residual({}, ustar_prev, u_face)) + div_tau
         if hybrid:
             balance -= sigma
@@ -169,6 +170,8 @@ def run(title, truth, face, rhs, restrict_state, restrict_flux, hybrid=False):
         rhs.residual({}, ustar_prev, ustar)  # same old state as face
         try:
             u_rhs = np.array(rhs.correct({}, p0_rhs, delta))
+            if rhs.attr('correction')['fraction'] < 1:
+                print(f"step {step}: RHS CoSTA applied {rhs.attr('correction')['fraction']}")
             results.append(('RHS CoSTA', u_rhs, np.array(rhs.fluxes({}, u_rhs))))
         except RuntimeError as e:
             print(f'step {step}: RHS CoSTA failed: {e}')
@@ -208,6 +211,31 @@ def run(title, truth, face, rhs, restrict_state, restrict_flux, hybrid=False):
         ut_prev, ustar_prev = ut, ustar
     ok &= switched_total > 0
     print(f'{title}: {"PASSED" if ok else "FAILED"}')
+    return ok, ut_prev
+
+
+def robustness(truth, face, ut_prev):
+    """A correction far too large to converge must not fail the step. It is
+    applied partially, with the failed cells reported, and the returned
+    fluxes conserve mass for the applied fraction."""
+    print('\nC. robustness')
+    ut = np.array(truth.predict(ut_prev))
+    dt = truth.attr('dt')
+    qstar = np.array(truth.fluxes({}, ut))
+    p0 = np.array(face.predict(ut_prev, dt))
+    tau = 1e4 * (qstar - np.array(face.fluxes({}, ut)))
+    face.residual({}, ut_prev, ut)
+    u, q = map(np.array, face.correct_face({}, p0, tau))
+    info = face.attr('correction')
+    div = np.array(face.divergence(tau))
+    balance = np.array(face.residual({}, ut_prev, u)) + info['fraction'] * div
+    bal = np.linalg.norm(balance) / np.linalg.norm(info['fraction'] * div) \
+        if info['fraction'] > 0 else np.linalg.norm(balance)
+    print(f"  fraction {info['fraction']}, {info['attempts']} attempts, "
+          f"failed cells {[c for c, _, _ in info['failed_cells']]}, balance {bal:.2e}")
+    truth.correct({}, ut, np.zeros(truth.ndof))
+    ok = info['fraction'] < 1 and len(info['failed_cells']) > 0 and bal < 1e-6
+    print(f'C. robustness: {"PASSED" if ok else "FAILED"}')
     return ok
 
 
@@ -219,7 +247,8 @@ def main(spe1):
         sims = [Remote('BlackOil', decks[n], ARGS)
                 for n in ('FINE', 'FINE_PERTURBED', 'FINE_PERTURBED')]
         try:
-            ok_a = run('A. operator error', *sims, lambda u: u, lambda q: q)
+            ok_a, ut = run('A. operator error', *sims, lambda u: u, lambda q: q)
+            ok_a &= robustness(sims[0], sims[1], ut)
         finally:
             for sim in sims:
                 sim.close()
@@ -227,7 +256,7 @@ def main(spe1):
         sims = [Remote('BlackOil', decks[n], ARGS) for n in ('FINE', 'COARSE', 'COARSE')]
         try:
             restriction = Restriction(make_decks.R, sims[0], sims[1])
-            ok_b = run('B. grid error', *sims, restriction.state, restriction.flux,
+            ok_b, _ = run('B. grid error', *sims, restriction.state, restriction.flux,
                        hybrid=True)
         finally:
             for sim in sims:

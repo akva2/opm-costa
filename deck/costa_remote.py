@@ -34,8 +34,8 @@ class Remote:
         if name.startswith('_'):
             raise AttributeError(name)
 
-        def call(*args):
-            self._conn.send((name, args))
+        def call(*args, **kwargs):
+            self._conn.send((name, (args, kwargs)))
             return self._recv()
         return call
 
@@ -61,6 +61,6 @@ def _serve(conn, variant, deck, args):
         name, args = msg
         try:
             value = getattr(sim, name)
-            conn.send(value if args is None else value(*args))
+            conn.send(value if args is None else value(*args[0], **args[1]))
         except Exception as e:
             conn.send(e)
