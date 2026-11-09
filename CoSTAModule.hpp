@@ -411,17 +411,25 @@ public:
         model.invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
     }
 
-    //! \brief Restart the Newton iteration count at iteration 1.
-    //! \details Iteration 0 would recycle the storage of the iterate as
-    //! old storage, see setOldState(). Being below the minimum number of
-    //! iterations forces a Newton update even if the residual is within
-    //! tolerances, which CoSTA corrections often are.
-    void restartIterations()
+    //! \brief Restart the Newton iteration count.
+    //! \param forceUpdate Whether to force a Newton update
+    //! \details Starts at iteration 1, as iteration 0 would recycle the
+    //! storage of the iterate as old storage, see setOldState(). Being below
+    //! the minimum number of iterations forces a Newton update even if the
+    //! residual is within tolerances, which CoSTA corrections often are.
+    //! Without forceUpdate, a converged iterate is accepted as is.
+    void restartIterations(bool forceUpdate = true)
     {
         auto& problem = this->simulator_.problem();
         problem.resetIterationForNewTimestep();
         problem.markTimestepInitialized();
         problem.advanceIteration();
+        if (!forceUpdate) {
+            const int minIter = this->solver_->model().param().newton_min_iter_;
+            while (problem.iterationContext().iteration() < minIter) {
+                problem.advanceIteration();
+            }
+        }
     }
 
     //! \brief Solve one substep of the current report step.
@@ -533,10 +541,11 @@ public:
 
     //! \brief Solve the corrected equations of the current step.
     //! \return False if the Newton iterations failed
-    bool solveCorrected()
+    //! \param forceUpdate Whether to force a Newton update, see restartIterations()
+    bool solveCorrected(bool forceUpdate)
     {
         const auto& timer = this->substep();
-        this->restartIterations();
+        this->restartIterations(forceUpdate);
         const auto& problem = this->simulator_.problem();
         const int maxIter = this->solver_->model().param().newton_max_iter_;
         try {
@@ -1137,7 +1146,9 @@ protected:
             }
             Opm::Source source = this->residualToSource(scaled);
             std::swap(source, origSource);
-            const bool converged = sim->solveCorrected();
+            // A zero correction leaves a converged prediction as it is.
+            const bool converged = sim->solveCorrected(
+                std::any_of(scaled.begin(), scaled.end(), [](double v) { return v != 0.0; }));
             std::swap(source, origSource);
             if (!converged) {
                 if (correction_.failedCells.empty()) {

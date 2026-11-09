@@ -5,7 +5,7 @@ restricted mass consistently to the original grid. The wells differ
 between the grids, so face CoSTA also gets a cell correction for what
 face fluxes cannot represent, which should be localized at the wells.
 
-Usage: python test_norne_refined.py <directory with NORNE_ATW2013.DATA>
+Usage: python test_norne_refined.py <directory with NORNE_ATW2013.DATA> [steps]
 """
 
 import os
@@ -21,15 +21,17 @@ DECK = 'NORNE_ATW2013.DATA'
 NSTEPS = 8
 R = 2
 
-# CoSTA assumes accurate solves, far below flow's default tolerances.
+# CoSTA assumes accurate solves, below flow's default tolerances. Tighter
+# than this, the refined model cannot be run for long: near round-off the
+# Newton iterations stall and the steps are chopped until they fail.
 # Only the states in memory are used, so no ECL output files are written.
-ARGS = ['--enable-ecl-output=false', '--linear-solver-reduction=1e-12',
-        '--tolerance-cnv=1e-10', '--tolerance-cnv-relaxed=1e-10',
-        '--tolerance-mb=1e-14', '--tolerance-mb-relaxed=1e-14',
+ARGS = ['--enable-ecl-output=false', '--linear-solver-reduction=1e-10',
+        '--tolerance-cnv=1e-8', '--tolerance-cnv-relaxed=1e-6',
+        '--tolerance-mb=1e-12', '--tolerance-mb-relaxed=1e-10',
         '--newton-max-iterations=30']
 
 
-def main(norne):
+def main(norne, nsteps=NSTEPS):
     with tempfile.TemporaryDirectory() as tmp:
         refine_vertical.main(os.path.join(norne, DECK), tmp, R)
         truth = Remote('BlackOil', os.path.join(tmp, DECK), ARGS)
@@ -39,7 +41,7 @@ def main(norne):
             restriction = Restriction(truth, face, (1, 1, R))
             # Ambiguous upwinding where a phase potential vanishes gives
             # flux errors up to about 1e-3, see test_norne.py.
-            ok, _ = run('Norne, refined truth', truth, face, rhs, NSTEPS, restriction,
+            ok, _ = run('Norne, refined truth', truth, face, rhs, nsteps, restriction,
                         hybrid=True, flux_tol=1e-3, require_switching=False)
         finally:
             for sim in (truth, face, rhs):
@@ -48,4 +50,5 @@ def main(norne):
 
 
 if __name__ == '__main__':
-    raise SystemExit(main(os.path.abspath(sys.argv[1])))
+    raise SystemExit(main(os.path.abspath(sys.argv[1]),
+                          int(sys.argv[2]) if len(sys.argv) > 2 else NSTEPS))
