@@ -243,6 +243,102 @@ public:
         return result;
     }
 
+    //! \brief Component amounts in each cell for a physical state.
+    //! \param vec Physical state, stateVars() values per cell
+    //! \return Storage times cell volume, numEq values per cell, in the
+    //! units of the residual times time (surface volumes by default)
+    std::vector<double> storage(const std::vector<double>& vec)
+    {
+        using EqVector = Opm::GetPropType<TypeTag, Opm::Properties::EqVector>;
+        using LocalResidual = Opm::GetPropType<TypeTag, Opm::Properties::LocalResidual>;
+        using Scalar = Opm::GetPropType<TypeTag, Opm::Properties::Scalar>;
+
+        auto& model = this->simulator_.model();
+        const auto current = model.solution(0);
+        this->updateSolution(vec, 0);
+        std::vector<double> result;
+        result.reserve(model.numGridDof() * numEq);
+        for (unsigned i = 0; i < model.numGridDof(); ++i) {
+            EqVector cell;
+            LocalResidual::template computeStorage<Scalar>(cell, model.intensiveQuantities(i, 0));
+            for (unsigned eq = 0; eq < numEq; ++eq) {
+                result.push_back(cell[eq] * model.dofTotalVolume(i));
+            }
+        }
+        model.solution(0) = current;
+        model.invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
+        return result;
+    }
+
+    //! \brief Find the physical state holding given component amounts.
+    //! \param amounts Component amounts as returned by storage()
+    //! \param guess Initial guess for the state
+    //! \details Solves storage(state) = amounts cell by cell with Newton's
+    //! method, including pressure. Primary variable switching is handled as
+    //! in the simulator.
+    std::vector<double> stateFromStorage(const std::vector<double>& amounts,
+                                         const std::vector<double>& guess)
+    {
+        using Evaluation = Opm::GetPropType<TypeTag, Opm::Properties::Evaluation>;
+        using GlobalEqVector = Opm::GetPropType<TypeTag, Opm::Properties::GlobalEqVector>;
+        using LocalResidual = Opm::GetPropType<TypeTag, Opm::Properties::LocalResidual>;
+        using Scalar = Opm::GetPropType<TypeTag, Opm::Properties::Scalar>;
+        constexpr int maxIter = 50;
+        constexpr Scalar tolerance = 1e-12;
+
+        auto& model = this->simulator_.model();
+        const unsigned numCells = model.numGridDof();
+        if (amounts.size() != numCells * numEq) {
+            throw std::runtime_error("Component amounts have wrong size");
+        }
+        std::array<Scalar, numEq> scale{};
+        for (unsigned i = 0; i < numCells; ++i) {
+            for (unsigned eq = 0; eq < numEq; ++eq) {
+                scale[eq] = std::max(scale[eq], std::abs(amounts[i * numEq + eq]));
+            }
+        }
+
+        const auto current = model.solution(0);
+        this->updateSolution(guess, 0);
+        GlobalEqVector residual(numCells), update(numCells);
+        bool converged = false;
+        for (int iter = 0; iter < maxIter && !converged; ++iter) {
+            converged = true;
+            for (unsigned i = 0; i < numCells; ++i) {
+                Dune::FieldVector<Evaluation, numEq> cell;
+                LocalResidual::template computeStorage<Evaluation>(cell,
+                                                                   model.intensiveQuantities(i, 0));
+                Dune::FieldMatrix<Scalar, numEq, numEq> jacobian;
+                const Scalar volume = model.dofTotalVolume(i);
+                for (unsigned eq = 0; eq < numEq; ++eq) {
+                    residual[i][eq] = cell[eq].value() * volume - amounts[i * numEq + eq];
+                    for (unsigned pv = 0; pv < numEq; ++pv) {
+                        jacobian[eq][pv] = cell[eq].derivative(pv) * volume;
+                    }
+                    if (std::abs(residual[i][eq]) > tolerance * scale[eq]) {
+                        converged = false;
+                    }
+                }
+                jacobian.solve(update[i], residual[i]);
+            }
+            if (!converged) {
+                model.newtonMethod().applyUpdate(model.solution(0), model.solution(0),
+                                                 update, residual);
+                model.invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
+            }
+        }
+        if (!converged) {
+            model.solution(0) = current;
+            model.invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
+            throw std::runtime_error("Finding the state for given component amounts did not converge");
+        }
+
+        auto result = this->state();
+        model.solution(0) = current;
+        model.invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
+        return result;
+    }
+
     //! \brief Set the state at the start of the time step.
     //! \details Besides the primary variables, this updates the cached
     //! storage term of the old time level. The linearizer otherwise
@@ -560,6 +656,28 @@ public:
         return this->computeFluxes();
     }
 
+    //! \brief Component amounts in each cell for a state.
+    //! \param mu Model parameters
+    //! \param u State
+    //! \return numEq values per cell, summable over cells
+    std::vector<double> storage(const ParameterMap&, const std::vector<double>& u)
+    {
+        return sim->storage(u);
+    }
+
+    //! \brief Find the state holding given component amounts.
+    //! \param mu Model parameters
+    //! \param amounts numEq values per cell, as from storage()
+    //! \param guess Initial guess for the state
+    //! \details Used for a mass consistent transfer of states between
+    //! grids, by summing amounts over the cells being merged.
+    std::vector<double> stateFromStorage(const ParameterMap&,
+                                         const std::vector<double>& amounts,
+                                         const std::vector<double>& guess)
+    {
+        return sim->stateFromStorage(amounts, guess);
+    }
+
     //! \brief Apply the face-cell incidence operator D to a face vector.
     //! \param q Face vector, ordered as faces(), numEq values per face
     //! \return Per-cell balance, numEq values per cell (+q on minus, -q on plus)
@@ -583,19 +701,27 @@ public:
     //! \param mu Model parameters
     //! \param uprev State to make a time-step from
     //! \param tau Face flux correction, ordered as faces()
+    //! \param sigma Optional residual correction, numEq values per cell,
+    //!              as for correct(). Empty for none.
     //! \return Tuple of corrected state and corrected fluxes, q = Q(u) + tau
     //! \details The correction tau is added to every face flux, which is
     //! equivalent to the cell source -D*tau. The returned fluxes therefore
-    //! satisfy the original cell balance for any tau.
+    //! satisfy the cell balance, with sigma added to the sources, for any
+    //! tau. Sigma is meant for what face fluxes cannot represent, such as
+    //! differing well models.
     std::tuple<std::vector<double>, std::vector<double>>
-    correctFace(const ParameterMap& mu,
-                const std::vector<double>& uprev, const std::vector<double>& tau)
+    correctFace(const ParameterMap&,
+                const std::vector<double>& uprev, const std::vector<double>& tau,
+                const std::vector<double>& sigma)
     {
-        std::vector<double> sigma = this->divergence(tau);
-        for (auto& s : sigma) {
-            s = -s;
+        std::vector<double> total = this->divergence(tau);
+        if (!sigma.empty() && sigma.size() != total.size()) {
+            throw std::runtime_error("Residual correction has wrong size");
         }
-        auto u = this->correctImpl(uprev, sigma);
+        for (std::size_t i = 0; i < total.size(); ++i) {
+            total[i] = (sigma.empty() ? 0.0 : sigma[i]) - total[i];
+        }
+        auto u = this->correctImpl(uprev, total);
 
         // Fluxes are evaluated at the corrected state.
         sim->model().simulator().model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
@@ -661,7 +787,11 @@ public:
           .def("faces", &CoSTAModule<TypeTag>::faces)
           .def("fluxes", &CoSTAModule<TypeTag>::fluxes)
           .def("divergence", &CoSTAModule<TypeTag>::divergence)
-          .def("correct_face", &CoSTAModule<TypeTag>::correctFace)
+          .def("storage", &CoSTAModule<TypeTag>::storage)
+          .def("state_from_storage", &CoSTAModule<TypeTag>::stateFromStorage)
+          .def("correct_face", &CoSTAModule<TypeTag>::correctFace,
+               pybind11::arg("mu"), pybind11::arg("uprev"), pybind11::arg("tau"),
+               pybind11::arg("sigma") = std::vector<double>{})
           .def_property_readonly("nfaces", [](CoSTAModule<TypeTag>& self)
                                  { self.ensureFaces(); return self.faces_.size(); })
           .def_readonly("ndof", &CoSTAModule<TypeTag>::ndof)

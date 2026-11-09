@@ -5,9 +5,12 @@ Two scenarios, with decks from make_decks.py:
  A. Operator error: truth FINE, model FINE_PERTURBED (perturbed transmissibilities).
     The exact labels satisfy delta* = -D tau*, so face CoSTA must recover the
     truth state and fluxes, while RHS CoSTA only recovers the state.
- B. Grid error: truth FINE restricted to the COARSE grid. The labels are only
-    approximately consistent (nonlinear storage, producer well), so face CoSTA
-    must conserve mass and improve the fluxes over both alternatives.
+ B. Grid error: truth FINE restricted to the COARSE grid. States are restricted
+    mass consistently: the coarse state holds the summed fine component
+    amounts. The labels are then consistent except at the producer, whose
+    well model differs between the grids. Face fluxes cannot represent that,
+    so face CoSTA also gets the cell correction sigma* = delta* + D tau*,
+    which must be localized, and must then recover the state and fluxes.
 
 Gas appears and redissolves, so the corrections are solved with primary
 variable switching. "switched" counts cells where gas is present in the
@@ -74,41 +77,38 @@ def gas_present(u, names):
 
 class Restriction:
     """Transfer from the fine to the coarse grid, both Cartesian and all active."""
-    def __init__(self, r, names, fine_faces, coarse_faces):
-        self.r, self.names = r, names
+    def __init__(self, r, fine, coarse):
+        self.fine, self.coarse = fine, coarse
+        self.names = coarse.state_vars
         nx, ny, nz = make_decks.NX, make_decks.NY, make_decks.NZ
-        index = {tuple(c): n for n, c in enumerate(coarse_faces['cartesian'])}
+        index = {tuple(c): n for n, c in enumerate(coarse.faces()['cartesian'])}
 
-        def coarse(c):
+        def parent(c):
             fx, fy = nx * r, ny * r
             i, j, k = c % fx, (c // fx) % fy, c // (fx * fy)
             return i // r + nx * (j // r + ny * (k // r))
-        self.parent = np.array([coarse(c) for c in range(nx * ny * nz * r**3)])
+        self.parent = np.array([parent(c) for c in range(nx * ny * nz * r**3)])
         self.face_map = []  # (fine face, coarse face)
-        for f, (m, p) in enumerate(fine_faces['cartesian']):
-            cm, cp = coarse(m), coarse(p)
+        for f, (m, p) in enumerate(fine.faces()['cartesian']):
+            cm, cp = parent(m), parent(p)
             if cm != cp:
                 self.face_map.append((f, index[(cm, cp)]))
         self.ncoarse = nx * ny * nz
         self.ncoarse_faces = len(index)
 
+    def sum(self, x, n):
+        """Sum n values per fine cell over each coarse cell."""
+        x = x.reshape(-1, n)
+        return np.column_stack([np.bincount(self.parent, x[:, i], self.ncoarse)
+                                for i in range(n)])
+
     def state(self, u):
+        """The coarse state holding the fine component amounts, starting
+        from cell averages."""
         n = len(self.names)
-        u = u.reshape(-1, n)
-        var = dict(zip(self.names, range(n)))
-        result = np.zeros((self.ncoarse, n))
-        count = np.bincount(self.parent, minlength=self.ncoarse)
-        for name, i in var.items():
-            if name == 'rs':
-                continue
-            result[:, i] = np.bincount(self.parent, u[:, i], self.ncoarse) / count
-        # Rs weighted by oil saturation (all cells have equal pore volume)
-        so = 1 - u[:, var['sw']] - u[:, var['sg']]
-        wsum = np.bincount(self.parent, so, self.ncoarse)
-        rs = np.bincount(self.parent, so * u[:, var['rs']], self.ncoarse)
-        mean = np.bincount(self.parent, u[:, var['rs']], self.ncoarse) / count
-        result[:, var['rs']] = np.where(wsum > 0, rs / np.maximum(wsum, 1e-300), mean)
-        return result.ravel()
+        guess = self.sum(u, n) / np.bincount(self.parent, minlength=self.ncoarse)[:, None]
+        amounts = self.sum(np.array(self.fine.storage({}, u)), NEQ)
+        return np.array(self.coarse.state_from_storage({}, amounts.ravel(), guess.ravel()))
 
     def flux(self, q):
         q = q.reshape(-1, NEQ)
@@ -118,7 +118,7 @@ class Restriction:
         return result.ravel()
 
 
-def run(title, truth, face, rhs, restrict_state, restrict_flux, exact):
+def run(title, truth, face, rhs, restrict_state, restrict_flux, hybrid=False):
     names = face.state_vars
     print(f'\n{title}: state {names}')
     ut_prev = np.array(truth.initial_condition({}))
@@ -141,9 +141,13 @@ def run(title, truth, face, rhs, restrict_state, restrict_flux, exact):
         rhs.residual({}, ustar_prev, ustar)  # same old state as face
 
         results = [('uncorrected', p0, q0)]
+        # Cell correction for what face fluxes cannot represent
+        sigma = delta + div_tau if hybrid else np.zeros(0)
         try:
-            u_face, q_face = map(np.array, face.correct_face({}, p0, tau))
+            u_face, q_face = map(np.array, face.correct_face({}, p0, tau, sigma))
             balance = np.array(face.residual({}, ustar_prev, u_face)) + div_tau
+            if hybrid:
+                balance -= sigma
             results.append(('face CoSTA', u_face, q_face))
         except RuntimeError as e:
             print(f'step {step}: face CoSTA failed: {e}')
@@ -158,6 +162,13 @@ def run(title, truth, face, rhs, restrict_state, restrict_flux, exact):
             u_rhs = None
 
         print(f'step {step}: |delta* + D tau*| / |delta*| = {rel(-div_tau, delta):.2e}')
+        if hybrid:
+            mag = np.abs(sigma.reshape(-1, NEQ)).sum(axis=1)
+            cells = np.argsort(mag)[::-1]
+            share = np.cumsum(mag[cells]) / mag.sum()
+            n99 = int(np.searchsorted(share, 0.99)) + 1
+            print(f'  sigma*: 99% in {n99} of {len(mag)} cells, largest at cells '
+                  f'{cells[:3].tolist()}')
         errors = {}
         for name, u, q in results:
             errs = state_errors(u, ustar, ustar_prev, names)
@@ -174,14 +185,9 @@ def run(title, truth, face, rhs, restrict_state, restrict_flux, exact):
         bal = np.linalg.norm(balance) / np.linalg.norm(div_tau)
         print(f'  face CoSTA balance {bal:.2e}, switched {switched} cells, '
               f'{over_step} over the step')
-        if exact:
-            ok &= errors['face CoSTA'] < 1e-5 and errors['RHS CoSTA'] > 1e-3
-        else:
-            ok &= bal < 1e-6 and errors['face CoSTA'] < min(errors['uncorrected'],
-                                                             errors['RHS CoSTA'])
+        ok &= bal < 1e-6 and errors['face CoSTA'] < 1e-5 and errors['RHS CoSTA'] > 1e-3
         ut_prev, ustar_prev = ut, ustar
-    if exact:
-        ok &= switched_total > 0
+    ok &= switched_total > 0
     print(f'{title}: {"PASSED" if ok else "FAILED"}')
     return ok
 
@@ -194,17 +200,16 @@ def main(spe1):
         sims = [Remote('BlackOil', decks[n], ARGS)
                 for n in ('FINE', 'FINE_PERTURBED', 'FINE_PERTURBED')]
         try:
-            ok_a = run('A. operator error', *sims, lambda u: u, lambda q: q, exact=True)
+            ok_a = run('A. operator error', *sims, lambda u: u, lambda q: q)
         finally:
             for sim in sims:
                 sim.close()
 
         sims = [Remote('BlackOil', decks[n], ARGS) for n in ('FINE', 'COARSE', 'COARSE')]
         try:
-            restriction = Restriction(make_decks.R, sims[1].state_vars,
-                                      sims[0].faces(), sims[1].faces())
+            restriction = Restriction(make_decks.R, sims[0], sims[1])
             ok_b = run('B. grid error', *sims, restriction.state, restriction.flux,
-                       exact=False)
+                       hybrid=True)
         finally:
             for sim in sims:
                 sim.close()
